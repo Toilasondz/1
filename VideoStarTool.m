@@ -6,11 +6,6 @@
 //   2. Xem code (QR) gần nhất từng nhập
 //   3. Auto chia beat                                   (VideoReviewEditVC + MultiSplitView)
 //   4. Auto nhập code + ảnh vào các phân cảnh           (VideoReviewEditVC + QRCodeManager)
-//
-// Mọi tên class / selector / ivar / kiểu tham số dưới đây đã được đối chiếu
-// trực tiếp với metadata Objective-C trong binary Video Star 14.3.3 (build 1809).
-//
-// Build:  xem README.md  (Theos hoặc clang thuần).
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
@@ -69,6 +64,8 @@
 - (id)fileManager;
 - (id)clipURLForSceneIndex:(NSUInteger)i clipIndex:(NSUInteger)c;
 // --- MultiSplitView
+// LƯU Ý: KHÔNG khai báo - (CMTime)currentTime; ở đây vì trùng selector hệ thống
+// (AVPlayer/AVAudioPlayer) gây lỗi ambiguous. Dùng helper VSCurrentTime() thay thế.
 - (BOOL)beatModeOn;
 - (void)toggleBeatMode;
 - (BOOL)hasNextBeat;
@@ -76,7 +73,6 @@
 - (void)setSplitPoint;
 - (void)doSplit;
 - (void)gotoTime:(CMTime)t;
-- (CMTime)currentTime;
 // --- QRCodeManager / CustomPopup
 + (id)sharedInstance;
 - (void)selectedCode:(NSString *)code withImageData:(NSData *)data;
@@ -92,6 +88,15 @@ static NSUInteger g_run;   // token huỷ: mỗi lần bắt đầu/dừng tăng
 
 static void VSAfter(int64_t ms, dispatch_block_t b) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, ms * NSEC_PER_MSEC), dispatch_get_main_queue(), b);
+}
+
+// Gọi selector currentTime an toàn (tránh ambiguous với AVAudioPlayer)
+static CMTime VSCurrentTime(id obj) {
+    if (!obj) return kCMTimeInvalid;
+    SEL sel = @selector(currentTime);
+    if (![obj respondsToSelector:sel]) return kCMTimeInvalid;
+    CMTime (*fn)(id, SEL) = (CMTime (*)(id, SEL))[obj methodForSelector:sel];
+    return fn(obj, sel);
 }
 
 // Đọc ivar/thuộc tính private bằng KVC (không ném exception ra ngoài)
@@ -605,7 +610,6 @@ static BOOL VSReplayPicked(id editor, id response) {
 
 // ============================================================================
 // CHỨC NĂNG 1 — Auto nhập ảnh vào các lớp hình ảnh
-//   Bạn chọn 1 ảnh/video trong bộ chọn gốc -> tool áp dụng cho mọi lớp cùng loại.
 // ============================================================================
 - (void)pickMediaOnEditor:(id)editor rid:(NSUInteger)rid completion:(void (^)(id resp, NSDictionary *info))done {
     if (!g_origPicked) { done(nil, nil); return; }
@@ -632,7 +636,6 @@ static BOOL VSReplayPicked(id editor, id response) {
     });
 }
 
-// Thay media ở các lớp: chọn lớp -> phát lại response gốc -> xác minh lớp đã đổi
 - (void)applyResponse:(id)resp toEditor:(id)editor kind:(NSString *)kind skip:(NSInteger)skip rid:(NSUInteger)rid
            completion:(void (^)(NSUInteger changed, NSUInteger total))done {
     id engine = [editor getMultiLayerEngine];
@@ -749,7 +752,6 @@ static BOOL VSReplayPicked(id editor, id response) {
 
 // ============================================================================
 // CHỨC NĂNG 3 — Auto chia beat
-//   splitView.hasNextBeat -> jumpToNextBeat -> chờ playhead nhảy -> setSplitPoint -> ... -> doSplit
 // ============================================================================
 - (void)runBeatSplit {
     id vc = VSFindVC(@"VideoReviewEditVC");
@@ -816,13 +818,13 @@ static BOOL VSReplayPicked(id editor, id response) {
     step = ^{
         if (rid != g_run) { step = nil; return; }
         if (++guard >= 4096 || ![sv hasNextBeat]) { finish(); return; }
-        CMTime from = [sv currentTime];
+        CMTime from = VSCurrentTime(sv);                 // ✅ đã fix
         [sv jumpToNextBeat];
         VSPoll(rid, 12, 100, ^BOOL{
-            CMTime cur = [sv currentTime];
+            CMTime cur = VSCurrentTime(sv);              // ✅ đã fix
             return CMTIME_IS_VALID(cur) && (CMTIME_IS_INVALID(from) || CMTimeCompare(cur, from) > 0);
         }, ^(BOOL moved) {
-            CMTime cur = [sv currentTime];
+            CMTime cur = VSCurrentTime(sv);              // ✅ đã fix
             if (!moved || (CMTIME_IS_VALID(last) && CMTimeCompare(cur, last) <= 0)) { finish(); return; }   // hết beat
             last = cur;
             [sv setSplitPoint];
@@ -836,8 +838,6 @@ static BOOL VSReplayPicked(id editor, id response) {
 
 // ============================================================================
 // CHỨC NĂNG 4 — Auto nhập code + ảnh vào các phân cảnh
-//   (a) chọn phạm vi trong "Hợp nhất phân cảnh"  (b) chọn ảnh QR (1 cho tất cả, hoặc 1 ảnh/phân cảnh)
-//   (c) chọn 1 ảnh/video dùng chung             (d) mỗi phân cảnh: nhập QR -> thay media -> Create
 // ============================================================================
 - (void)runMultiScene {
     id vc = VSFindVC(@"VideoReviewEditVC");
@@ -882,7 +882,6 @@ static BOOL VSReplayPicked(id editor, id response) {
     }];
 }
 
-// Bước (c): mở Nhiều lớp ở phân cảnh đầu và để người dùng chọn media dùng chung
 - (void)msPickMediaAndRun:(id)vc start:(NSUInteger)start count:(NSUInteger)count codes:(NSArray<NSString *> *)codes
                     datas:(NSArray<NSData *> *)datas rid:(NSUInteger)rid origLast:(NSUInteger)origLast {
     [self status:@"Đang mở Nhiều lớp ở phân cảnh đầu…"];
@@ -937,7 +936,6 @@ static BOOL VSReplayPicked(id editor, id response) {
     sceneStep();
 }
 
-// Mở Nhiều lớp của phân cảnh `scene`; trả về editor đúng phân cảnh
 - (void)openEditorForScene:(NSUInteger)scene review:(id)rvc rid:(NSUInteger)rid completion:(void (^)(id editor))done {
     id (^current)(void) = ^id{
         id ed = VSFindVC(@"MultiLayerWizEffectVC");
@@ -953,8 +951,6 @@ static BOOL VSReplayPicked(id editor, id response) {
     VSPoll(rid, 80, 100, ^BOOL{ return current() != nil; }, ^(BOOL ok) { done(ok ? current() : nil); });
 }
 
-// Nhập 1 code QR vào editor bằng chính QRCodeManager của Video Star.
-// QRCodeManager phải trỏ delegate vào editor thì importedData:code: mới chạy.
 - (void)importCode:(NSString *)code data:(NSData *)data intoEditor:(id)editor rid:(NSUInteger)rid completion:(void (^)(NSString *err))done {
     id qr = [NSClassFromString(@"QRCodeManager") respondsToSelector:@selector(sharedInstance)] ? [NSClassFromString(@"QRCodeManager") sharedInstance] : nil;
     if (!qr || ![qr respondsToSelector:@selector(selectedCode:withImageData:)]) { done(@"Không tìm thấy bộ xử lý code của Video Star."); return; }
@@ -973,7 +969,7 @@ static BOOL VSReplayPicked(id editor, id response) {
     }, ^(BOOL ok) {
         if (blocked) { [self restoreQRDelegate]; done(@"Video Star hiện popup yêu cầu mua gói — tool không tự bấm. Dừng."); return; }
         if (!ok) { [self restoreQRDelegate]; done(@"Code chưa được Video Star nhập xong (hết thời gian chờ)."); return; }
-        VSAfter(700, ^{   // chờ preset dựng xong, bấm nốt popup còn lại
+        VSAfter(700, ^{
             id engine = [editor getMultiLayerEngine];
             VSPoll(rid, 60, 80, ^BOOL{
                 VSHandleEditorPopups(editor);
@@ -986,7 +982,6 @@ static BOOL VSReplayPicked(id editor, id response) {
     });
 }
 
-// Bấm nút Create gốc rồi chờ editor đóng (render có thể lâu: tối đa 60 giây)
 - (void)createInEditor:(id)editor rid:(NSUInteger)rid completion:(void (^)(NSString *err))done {
     BOOL fired = NO;
     id item = VSValue(editor, @"createBarButton");
@@ -1010,7 +1005,6 @@ static BOOL VSReplayPicked(id editor, id response) {
     });
 }
 
-// Chọn ảnh từ thư viện: PHPicker (iOS 14+, giữ thứ tự từ iOS 15) hoặc từng ảnh một (iOS cũ)
 - (void)pickImagesMax:(NSUInteger)maxCount rid:(NSUInteger)rid completion:(void (^)(NSArray<UIImage *> *))done {
     VSPickerDelegate *d = [VSPickerDelegate new];
     self.pickerDelegate = d;
