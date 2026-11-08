@@ -1,0 +1,9 @@
+Package: com.yourname.videostartool
+Name: VideoStarTool
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Bộ 4 chức năng tự động cho Video Star 14.3.3 (auto layer, xem QR, chia beat, auto scene)
+Maintainer: your-name
+Author: your-name
+Section: Tweaks
+Depends: mobilesubstrate
