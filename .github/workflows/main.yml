@@ -1,32 +1,126 @@
-name: Build
+name: Build VideoStarTool
 
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-13
+    name: Build ${{ matrix.scheme }} (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        scheme: [ rootful, rootless ]
+        # macOS 13 đã bị GitHub retire từ 2025-12 → dùng macos-latest (macOS 26 arm64)
+        runner: [ macos-latest ]
+
+    env:
+      THEOS: ${{ github.workspace }}/theos
+      THEOS_PACKAGE_SCHEME: ${{ matrix.scheme }}
+      FINALPACKAGE: 1
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Setup Theos
-        run: |
-          git clone --recursive --depth 1 https://github.com/theos/theos.git $HOME/theos
-          echo "$HOME/theos/bin" >> $GITHUB_PATH
-          brew install ldid xz dpkg make
-          echo "$(brew --prefix dpkg)/bin" >> $GITHUB_PATH
-          echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
-          mkdir -p $HOME/theos/sdks
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          cp -R "$SDK" "$HOME/theos/sdks/iPhoneOS$(xcrun --sdk iphoneos --show-sdk-version).sdk"
-
-      - name: Build
-        env:
-          THEOS: ${{ github.workspace }}/../theos
-        run: |
-          export THEOS=$HOME/theos
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
-
-      - uses: actions/upload-artifact@v4
+      # -------------------------------------------------------------
+      # 1) Cache Theos để build lần sau nhanh hơn
+      # -------------------------------------------------------------
+      - name: Cache Theos
+        id: cache-theos
+        uses: actions/cache@v4
         with:
-          name: deb
-          path: packages/*.deb
+          path: ${{ github.workspace }}/theos
+          key: theos-${{ runner.os }}-${{ runner.arch }}-v3
+
+      # -------------------------------------------------------------
+      # 2) Cài Theos (nếu cache miss)
+      # -------------------------------------------------------------
+      - name: Install Theos
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          echo "$THEOS/bin" >> "$GITHUB_PATH"
+
+      - name: Add Theos to PATH (cache hit)
+        if: steps.cache-theos.outputs.cache-hit == 'true'
+        run: echo "$THEOS/bin" >> "$GITHUB_PATH"
+
+      # -------------------------------------------------------------
+      # 3) Cài Theos SDK (fallback về SDK của Xcode runner nếu tải fail)
+      # -------------------------------------------------------------
+      - name: Install Theos SDK
+        run: |
+          set -e
+          mkdir -p "$THEOS/sdks"
+          if [ ! -d "$THEOS/sdks/iPhoneOS16.5.sdk" ] && \
+             [ ! -d "$THEOS/sdks/iPhoneOS18.0.sdk" ]; then
+            echo "Trying to download prebuilt SDK..."
+            if curl -fsSL -o /tmp/sdk.tar.xz \
+                "https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz"; then
+              tar -xJf /tmp/sdk.tar.xz -C "$THEOS/sdks"
+            else
+              echo "Download failed, falling back to Xcode SDK"
+              SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+              VER=$(xcrun --sdk iphoneos --show-sdk-version)
+              cp -R "$SDK" "$THEOS/sdks/iPhoneOS${VER}.sdk"
+            fi
+          fi
+          echo "=== Available SDKs ==="
+          ls -1 "$THEOS/sdks"
+
+      # -------------------------------------------------------------
+      # 4) Cài build tools
+      # -------------------------------------------------------------
+      - name: Install build tools
+        run: |
+          set -e
+          brew install ldid xz dpkg make
+          echo "$(brew --prefix dpkg)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      # -------------------------------------------------------------
+      # 5) Build
+      # -------------------------------------------------------------
+      - name: Build tweak
+        run: |
+          set -e
+          make clean || true
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=${{ matrix.scheme }}
+          echo "==== PACKAGES ===="
+          ls -la packages/ || true
+          echo "==== THEOS _ ===="
+          ls -la .theos/_/ || true
+
+      # -------------------------------------------------------------
+      # 6) Upload .deb artifact
+      # -------------------------------------------------------------
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideoStarTool-${{ matrix.scheme }}-deb
+          path: |
+            packages/*.deb
+            .theos/_/*.dylib
+            .theos/_/*.plist
+          if-no-files-found: error
+          retention-days: 30
+
+      # -------------------------------------------------------------
+      # 7) Push tag v* → tạo GitHub Release + attach .deb
+      # -------------------------------------------------------------
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packages/*.deb
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
