@@ -16,21 +16,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # rootful  = cài vào /           (không truyền THEOS_PACKAGE_SCHEME)
+        # rootless = cài vào /var/jb     (truyền THEOS_PACKAGE_SCHEME=rootless)
         scheme: [ rootful, rootless ]
-        # macOS 13 đã bị GitHub retire từ 2025-12 → dùng macos-latest (macOS 26 arm64)
         runner: [ macos-latest ]
 
     env:
       THEOS: ${{ github.workspace }}/theos
-      THEOS_PACKAGE_SCHEME: ${{ matrix.scheme }}
       FINALPACKAGE: 1
+      # KHÔNG đặt THEOS_PACKAGE_SCHEME ở đây — sẽ được set có điều kiện ở bước build
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       # -------------------------------------------------------------
-      # 1) Cache Theos để build lần sau nhanh hơn
+      # 1) Cache Theos
       # -------------------------------------------------------------
       - name: Cache Theos
         id: cache-theos
@@ -54,7 +55,7 @@ jobs:
         run: echo "$THEOS/bin" >> "$GITHUB_PATH"
 
       # -------------------------------------------------------------
-      # 3) Cài Theos SDK (fallback về SDK của Xcode runner nếu tải fail)
+      # 3) Cài Theos SDK (fallback về SDK của Xcode nếu tải fail)
       # -------------------------------------------------------------
       - name: Install Theos SDK
         run: |
@@ -87,13 +88,19 @@ jobs:
           echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
 
       # -------------------------------------------------------------
-      # 5) Build
+      # 5) Build — PHÂN BIỆT rootful vs rootless
       # -------------------------------------------------------------
       - name: Build tweak
         run: |
           set -e
           make clean || true
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=${{ matrix.scheme }}
+          if [ "${{ matrix.scheme }}" = "rootful" ]; then
+            echo ">>> Building ROOTFUL (no THEOS_PACKAGE_SCHEME)"
+            make package FINALPACKAGE=1
+          else
+            echo ">>> Building ROOTLESS (THEOS_PACKAGE_SCHEME=rootless)"
+            make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+          fi
           echo "==== PACKAGES ===="
           ls -la packages/ || true
           echo "==== THEOS _ ===="
