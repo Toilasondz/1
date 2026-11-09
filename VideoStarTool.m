@@ -97,7 +97,7 @@ static BOOL VSIsKind(id obj, NSString *name) {
 static void VSPoll(NSUInteger rid, int64_t ms, NSUInteger tries, BOOL (^cond)(void), void (^done)(BOOL ok)) {
     if (rid != g_run) return;
     BOOL ok = NO;
-    @try { ok = cond(); } @catch (NSException *e) {}
+    @try { ok = cond(); } @catch (NSException *e) { VSLog(@"poll exception: %@", e.reason ?: e.name); }
     if (ok) { done(YES); return; }
     if (tries == 0) { done(NO); return; }
     VSAfter(ms, ^{ VSPoll(rid, ms, tries - 1, cond, done); });
@@ -419,6 +419,7 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
 + (instancetype)shared;
 - (void)installIfNeeded;
 - (void)clampFab;
+- (void)msBackToCodePanel;
 @end
 
 @implementation VSRootVC
@@ -435,7 +436,6 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
 
 - (void)installIfNeeded {
     if (self.window) return;
-    // CHỜ 3 GIÂY ĐỂ PATCH PRO LOAD XONG (FIX LỖI MẤT PRO)
     static BOOL didDelay = NO;
     if (!didDelay) {
         didDelay = YES;
@@ -461,10 +461,10 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
     fab.frame = CGRectMake(b.size.width - 64, b.size.height * 0.35, 48, 48);
     fab.backgroundColor = [UIColor colorWithRed:0.10 green:0.10 blue:0.12 alpha:0.82];
     fab.layer.cornerRadius = 24;
-    fab.layer.borderWidth = 1.5; fab.layer.borderColor = [UIColor colorWithRed:0.35 green:0.85 blue:0.55 alpha:1].CGColor;
+    fab.layer.borderWidth = 1.5; fab.layer.borderColor = VSCyan().CGColor;
     [fab setTitle:@"VS" forState:UIControlStateNormal];
     fab.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    [fab setTitleColor:[UIColor colorWithRed:0.35 green:0.85 blue:0.55 alpha:1] forState:UIControlStateNormal];
+    [fab setTitleColor:VSCyan() forState:UIControlStateNormal];
     [fab addTarget:self action:@selector(fabTapped) forControlEvents:UIControlEventTouchUpInside];
     [fab addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(fabPan:)]];
     [root.view addSubview:fab];
