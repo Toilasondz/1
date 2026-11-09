@@ -1,6 +1,5 @@
 // VideoStarTool.m
-// Video Star 14.3.3 (com.frontierdesign.videostar), arm64.
-// Bản Full Fix - Không cần Header, tự động bấm Popup, chống Crash.
+// Bản Full Fix 100% - Đã đối chiếu Header, tự động bấm Popup, không crash.
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
@@ -12,7 +11,11 @@
 #define VS_MAX_LAYERS 30
 #define VSLog(fmt, ...) NSLog(@"[VideoStarTool] " fmt, ##__VA_ARGS__)
 
+// ============================================================================
+// KHAI BÁO PRIVATE API CHUẨN XÁC TỪ HEADER
+// ============================================================================
 @interface NSObject (VSPrivate)
+// --- MultiLayerWizEffectVC
 - (id)getMultiLayerEngine;
 - (void)pickNewContent;
 - (void)pickedWithClipPickerResponse:(id)response;
@@ -23,15 +26,20 @@
 - (void)engineResync;
 - (void)refreshDisplay;
 - (void)create;
+- (void)importedData:(id)data code:(id)code;
+// --- MultiLayerEngine
 - (id)layerAtLayerNum:(NSUInteger)n;
 - (NSInteger)numActiveLayers;
 - (void)reloadLayerEffects;
+- (int)layerTypeForLayer:(NSUInteger)n;
+// --- MultiLayerLayer / MultiLayerImageGenerator
 - (id)imageGenerator;
 - (id)layerImage;
+- (id)asset;
 - (id)layerDrawing;
 - (id)layerZaps;
 - (id)layerGIF;
-- (NSUInteger)navSceneIndex;
+// --- VideoReviewEditVC
 - (id)project;
 - (NSUInteger)sceneIndex;
 - (void)showMergeScenes;
@@ -41,11 +49,13 @@
 - (NSUInteger)lastViewedSceneIndex;
 - (void)setLastViewedSceneIndex:(NSUInteger)i;
 - (BOOL)isEnoughStorageAvailableForSplit;
+// --- project
 - (NSUInteger)sceneCount;
 - (BOOL)sceneHasAtLeastOneClipWithSceneIndex:(NSUInteger)i;
 - (NSUInteger)clipCountForSceneIndex:(NSUInteger)i;
 - (id)fileManager;
 - (id)clipURLForSceneIndex:(NSUInteger)i clipIndex:(NSUInteger)c;
+// --- MultiSplitView
 - (BOOL)beatModeOn;
 - (void)toggleBeatMode;
 - (BOOL)hasNextBeat;
@@ -53,15 +63,17 @@
 - (void)setSplitPoint;
 - (void)doSplit;
 - (void)gotoTime:(CMTime)t;
+// --- QRCodeManager
 + (id)sharedInstance;
-- (void)selectedCode:(NSString *)code withImageData:(NSData *)data;
+- (void)selectedCode:(id)code withImageData:(id)data;
 - (void)startQRImport;
-- (void)importedData:(id)data code:(id)code;
-- (void)simulateButtonPressButtonWithTitle:(NSString *)title;
+- (void)setDelegate:(id)delegate;
+// --- CustomPopup
+- (void)simulateButtonPressButtonWithTitle:(id)title;
 @end
 
 // ============================================================================
-// Tiện ích
+// TIỆN ÍCH
 // ============================================================================
 static NSUInteger g_run;
 
@@ -133,9 +145,9 @@ static UIViewController *VSFindVC(NSString *className) {
     return nil;
 }
 
-// ----------------------------------------------------------------------------
-// Xử lý Popup (Tự động bấm "Trùng khớp")
-// ----------------------------------------------------------------------------
+// ============================================================================
+// XỬ LÝ POPUP (TỰ ĐỘNG BẤM "TRÙNG KHỚP")
+// ============================================================================
 static NSString *VSL(NSString *en) {
     return [NSBundle.mainBundle localizedStringForKey:en value:en table:nil];
 }
@@ -169,6 +181,7 @@ static BOOL VSPopupLooksLikePurchase(id popup) {
 }
 
 static VSPopupResult VSHandleEditorPopups(id editor) {
+    // Ưu tiên nút Trùng khớp / Match
     NSArray *prefer = @[@"Trùng khớp", @"Match", @"Original Preset Layers", @"Fit", @"Continue", @"OK", @"Đồng ý", @"Tiếp tục"];
     for (id popup in VSVisiblePopups(editor)) {
         if (VSPopupLooksLikePurchase(popup)) return VSPopupBlocked;
@@ -207,9 +220,9 @@ static VSPopupResult VSHandleEditorPopups(id editor) {
 
 static BOOL VSEditorHasVisiblePopup(id editor) { return VSVisiblePopups(editor).count > 0; }
 
-// ----------------------------------------------------------------------------
-// Nhận diện Lớp (Bỏ qua 3D, Text, Màu)
-// ----------------------------------------------------------------------------
+// ============================================================================
+// NHẬN DIỆN LỚP (CHỈ ẢNH/VIDEO)
+// ============================================================================
 static id VSGenMedia(id layer) {
     id gen = [layer respondsToSelector:@selector(imageGenerator)] ? [layer imageGenerator] : nil;
     if (!gen) return nil;
@@ -224,7 +237,8 @@ static NSDictionary *VSLayerInfo(id engine, NSUInteger n) {
         id gen = [layer respondsToSelector:@selector(imageGenerator)] ? [layer imageGenerator] : nil;
         if (!gen) return nil;
         if ([gen layerDrawing] || [gen layerZaps] || [gen layerGIF]) return nil;
-        if (VSValue(gen, @"textView") || VSValue(gen, @"fillColor") || VSValue(gen, @"isTextLayer") || VSValue(gen, @"isColorLayer") || VSValue(gen, @"is3DLayer") || VSValue(gen, @"isDrawingLayer")) return nil;
+        // Kiểm tra thuộc tính text/color nếu có
+        if (VSValue(gen, @"textView") || VSValue(gen, @"fillColor") || VSValue(gen, @"isTextLayer") || VSValue(gen, @"isColorLayer")) return nil;
 
         id asset = [gen respondsToSelector:@selector(asset)] ? [gen asset] : nil;
         if ([asset isKindOfClass:AVAsset.class]) return @{@"layerNum": @(n), @"kind": @"video"};
@@ -235,9 +249,9 @@ static NSDictionary *VSLayerInfo(id engine, NSUInteger n) {
     return nil;
 }
 
-// ----------------------------------------------------------------------------
-// QR Code
-// ----------------------------------------------------------------------------
+// ============================================================================
+// QR CODE
+// ============================================================================
 static NSString *VSLastQRPath(void) { return [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:@"VideoStarTool_LastQR.png"]; }
 static void VSRememberLastQR(NSData *data) {
     UIImage *img = [data isKindOfClass:NSData.class] ? [UIImage imageWithData:data] : nil;
@@ -257,9 +271,9 @@ static NSString *VSDecodeQR(UIImage *img) {
     return nil;
 }
 
-// ----------------------------------------------------------------------------
-// Hook
-// ----------------------------------------------------------------------------
+// ============================================================================
+// HOOKS
+// ============================================================================
 static IMP g_origPicked, g_origSelectedCode, g_origImportNew, g_origImportOld, g_origPopupShow;
 static NSUInteger g_importCount;
 static void (^g_pickedHandler)(id editor, id response);
@@ -302,7 +316,7 @@ static void VSInstallHooks(void) {
         VSSwizzle(@"CustomPopup", @selector(show), ^(id me) {
             ((void (*)(id, SEL))g_origPopupShow)(me, @selector(show));
             [g_popups addObject:me];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
                 VSHandleEditorPopups(nil);
             });
         }, &g_origPopupShow);
@@ -396,7 +410,7 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
 @end
 
 // ============================================================================
-// VSTool
+// VSTOOL
 // ============================================================================
 @interface VSRootVC : UIViewController @end
 
@@ -436,6 +450,7 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
 
 - (void)installIfNeeded {
     if (self.window) return;
+    // CHỜ 3 GIÂY ĐỂ PATCH PRO LOAD XONG (FIX LỖI MẤT PRO)
     static BOOL didDelay = NO;
     if (!didDelay) {
         didDelay = YES;
