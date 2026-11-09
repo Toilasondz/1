@@ -4,10 +4,12 @@ INSTALL_TARGET_PROCESSES = VideoStar
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = VideoStarTool
-VideoStarTool_FILES = VideoStarTool.m
-VideoStarTool_CFLAGS = -fobjc-arc
-VideoStarTool_FRAMEWORKS = UIKit Foundation AVFoundation CoreImage PhotosUI
-VideoStarTool_PRIVATE_FRAMEWORKS =
+# Tên tweak = tên file .dylib output
+TWEAK_NAME = ZZZZZZVideoStarTool
+
+# File nguồn vẫn giữ tên VideoStarTool.m
+ZZZZZZVideoStarTool_FILES = VideoStarTool.m
+ZZZZZZVideoStarTool_CFLAGS = -fobjc-arc
+ZZZZZZVideoStarTool_FRAMEWORKS = UIKit Foundation AVFoundation CoreImage PhotosUI
 
 include $(THEOS_MAKE_PATH)/tweak.mk
