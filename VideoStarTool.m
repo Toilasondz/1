@@ -1,16 +1,4 @@
-// VideoStarTool.m
-// Video Star 14.3.3 (com.frontierdesign.videostar), arm64.
-//
-// 4 chức năng:
-//   1. Auto nhập ảnh/video vào các lớp hình ảnh        (MultiLayerWizEffectVC)
-//   2. Xem code (QR) gần nhất từng nhập
-//   3. Auto chia beat                                   (VideoReviewEditVC + MultiSplitView)
-//   4. Auto nhập code + ảnh vào các phân cảnh           (VideoReviewEditVC + QRCodeManager)
-//
-// Mọi tên class / selector / ivar / kiểu tham số dưới đây đã được đối chiếu
-// trực tiếp với metadata Objective-C trong binary Video Star 14.3.3 (build 1809).
-//
-// Build:  xem README.md  (Theos hoặc clang thuần).
+// VideoStarTool.m — bản đã fix compile
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
@@ -21,11 +9,8 @@
 #define VS_MAX_LAYERS 30
 #define VSLog(fmt, ...) NSLog(@"[VideoStarTool] " fmt, ##__VA_ARGS__)
 
-// ============================================================================
-// PRIVATE API của Video Star (chữ ký lấy từ type-encoding trong binary)
-// ============================================================================
 @interface NSObject (VSPrivate)
-// --- MultiLayerWizEffectVC (editor nhiều lớp)
+// --- MultiLayerWizEffectVC
 - (id)getMultiLayerEngine;
 - (void)pickNewContent;
 - (void)pickedWithClipPickerResponse:(id)response;
@@ -61,13 +46,13 @@
 - (NSUInteger)lastViewedSceneIndex;
 - (void)setLastViewedSceneIndex:(NSUInteger)i;
 - (BOOL)isEnoughStorageAvailableForSplit;
-// --- project (New_Project / Old_Project) + ProjectFileManager
+// --- project
 - (NSUInteger)sceneCount;
 - (BOOL)sceneHasAtLeastOneClipWithSceneIndex:(NSUInteger)i;
 - (NSUInteger)clipCountForSceneIndex:(NSUInteger)i;
 - (id)fileManager;
 - (id)clipURLForSceneIndex:(NSUInteger)i clipIndex:(NSUInteger)c;
-// --- MultiSplitView
+// --- MultiSplitView (KHÔNG khai báo currentTime — dùng helper VSCurrentTime)
 - (BOOL)beatModeOn;
 - (void)toggleBeatMode;
 - (BOOL)hasNextBeat;
@@ -75,11 +60,9 @@
 - (void)setSplitPoint;
 - (void)doSplit;
 - (void)gotoTime:(CMTime)t;
-- (CMTime)currentTime;
-// --- QRCodeManager / CustomPopup
+// --- QRCodeManager / CustomPopup (KHÔNG khai báo setDelegate: — dùng methodForSelector)
 + (id)sharedInstance;
 - (void)selectedCode:(NSString *)code withImageData:(NSData *)data;
-- (void)setDelegate:(id)d;
 - (void)startQRImport;
 - (void)importedData:(id)data code:(id)code;
 - (void)simulateButtonPressButtonWithTitle:(NSString *)title;
@@ -87,15 +70,31 @@
 @end
 
 // ============================================================================
-// Tiện ích chung
+// Tiện ích
 // ============================================================================
-static NSUInteger g_run;   // token huỷ: mỗi lần bắt đầu/dừng tăng 1, mọi poll cũ tự thoát
+static NSUInteger g_run;
 
 static void VSAfter(int64_t ms, dispatch_block_t b) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, ms * NSEC_PER_MSEC), dispatch_get_main_queue(), b);
 }
 
-// Đọc ivar/thuộc tính private bằng KVC (không ném exception ra ngoài)
+// Gọi selector currentTime an toàn (tránh ambiguous với AVAudioPlayer)
+static CMTime VSCurrentTime(id obj) {
+    if (!obj) return kCMTimeInvalid;
+    SEL sel = @selector(currentTime);
+    if (![obj respondsToSelector:sel]) return kCMTimeInvalid;
+    CMTime (*fn)(id, SEL) = (CMTime (*)(id, SEL))[obj methodForSelector:sel];
+    return fn(obj, sel);
+}
+
+// Gọi selector setDelegate: an toàn (tránh conflict NSFileManagerDelegate)
+static void VSSetQRDelegate(id qr, id delegate) {
+    if (!qr) return;
+    SEL sel = @selector(setDelegate:);
+    if (![qr respondsToSelector:sel]) return;
+    ((void (*)(id, SEL, id))[qr methodForSelector:sel])(qr, sel, delegate);
+}
+
 static id VSValue(id obj, NSString *key) {
     if (!obj || !key.length) return nil;
     @try { return [obj valueForKey:key]; } @catch (...) { return nil; }
@@ -106,7 +105,6 @@ static BOOL VSIsKind(id obj, NSString *name) {
     return obj && c && [obj isKindOfClass:c];
 }
 
-// Poll mỗi `ms` tới khi cond() đúng hoặc hết `tries` lần. Tự dừng nếu run bị huỷ.
 static void VSPoll(NSUInteger rid, int64_t ms, NSUInteger tries, BOOL (^cond)(void), void (^done)(BOOL ok)) {
     if (rid != g_run) return;
     BOOL ok = NO;
@@ -116,7 +114,6 @@ static void VSPoll(NSUInteger rid, int64_t ms, NSUInteger tries, BOOL (^cond)(vo
     VSAfter(ms, ^{ VSPoll(rid, ms, tries - 1, cond, done); });
 }
 
-// Tìm view controller thuộc class `name` đang hiển thị (duyệt presented / nav / tab / child)
 static UIViewController *VSFindVCIn(UIViewController *vc, Class cls, int depth) {
     if (!vc || depth > 14) return nil;
     UIViewController *r = nil;
@@ -148,10 +145,7 @@ static UIViewController *VSFindVC(NSString *className) {
     return nil;
 }
 
-// ----------------------------------------------------------------------------
-// Popup (CustomPopup) — chỉ bấm các nút chấp nhận, KHÔNG bao giờ bấm popup mua gói
-// ----------------------------------------------------------------------------
-static NSString *VSL(NSString *en) {   // dịch theo ngôn ngữ đang dùng của Video Star
+static NSString *VSL(NSString *en) {
     return [NSBundle.mainBundle localizedStringForKey:en value:en table:nil];
 }
 
@@ -166,11 +160,7 @@ static BOOL VSPopupLooksLikePurchase(id popup) {
 
 static id g_lastPressedPopup;
 static CFAbsoluteTime g_lastPressedAt;
-
 typedef NS_ENUM(NSInteger, VSPopupResult) { VSPopupNone = 0, VSPopupPressed, VSPopupBlocked };
-
-// Mọi CustomPopup mà Video Star gọi -show đều được ghi lại (weak): tool nhận ra popup dù nó do
-// QRCodeManager hay editor hiện ra, không phụ thuộc popup nằm ở ivar nào.
 static NSHashTable *g_popups;
 
 static NSArray *VSVisiblePopups(id editor) {
@@ -181,19 +171,16 @@ static NSArray *VSVisiblePopups(id editor) {
     for (id p in all) {
         if (!VSIsKind(p, @"CustomPopup")) continue;
         UIView *dim = VSValue(p, @"dimView");
-        if ([dim isKindOfClass:UIView.class] && dim.window) [vis addObject:p];   // popup cũ đã đóng thì dim.window = nil
+        if ([dim isKindOfClass:UIView.class] && dim.window) [vis addObject:p];
     }
     return vis;
 }
 
-// Popup nào đang hiện thì bấm nút phù hợp nhất: "Trùng khớp" (Fit) của hộp co giãn QR, "OK" của
-// hộp "Các lớp Cài đặt sẵn Gốc". Không bao giờ bấm popup có nội dung mua gói.
 static VSPopupResult VSHandleEditorPopups(id editor) {
     NSArray *prefer = @[@"Original Preset Layers", @"Fit", @"Continue", @"OK"];
     for (id popup in VSVisiblePopups(editor)) {
         if (VSPopupLooksLikePurchase(popup)) return VSPopupBlocked;
         if (popup == g_lastPressedPopup && CFAbsoluteTimeGetCurrent() - g_lastPressedAt < 0.6) return VSPopupPressed;
-
         NSArray *titles = VSValue(popup, @"_buttonStrings");
         NSArray *buttons = VSValue(popup, @"_buttons");
         for (NSString *en in prefer) {
@@ -216,7 +203,6 @@ static VSPopupResult VSHandleEditorPopups(id editor) {
                         }
                 }
             } @catch (NSException *e) { VSLog(@"popup press exception: %@", e.reason ?: e.name); }
-            VSLog(@"popup auto-pressed: %@", hit);
             return VSPopupPressed;
         }
     }
@@ -225,16 +211,12 @@ static VSPopupResult VSHandleEditorPopups(id editor) {
 
 static BOOL VSEditorHasVisiblePopup(id editor) { return VSVisiblePopups(editor).count > 0; }
 
-// ----------------------------------------------------------------------------
-// Lớp hình ảnh: đọc media thật từ imageGenerator của từng lớp
-// ----------------------------------------------------------------------------
 static id VSGenMedia(id layer) {
     id gen = [layer respondsToSelector:@selector(imageGenerator)] ? [layer imageGenerator] : nil;
     if (!gen) return nil;
     return [gen respondsToSelector:@selector(asset)] && [gen asset] ? [gen asset] : [gen layerImage];
 }
 
-// @{layerNum, kind: video|image} nếu lớp n đang chứa ảnh/video; nil nếu rỗng hoặc là vẽ/zap/gif
 static NSDictionary *VSLayerInfo(id engine, NSUInteger n) {
     @try {
         id layer = [engine layerAtLayerNum:n];
@@ -244,13 +226,10 @@ static NSDictionary *VSLayerInfo(id engine, NSUInteger n) {
         id asset = [gen respondsToSelector:@selector(asset)] ? [gen asset] : nil;
         if ([asset isKindOfClass:AVAsset.class]) return @{@"layerNum": @(n), @"kind": @"video"};
         if ([gen layerImage]) return @{@"layerNum": @(n), @"kind": @"image"};
-    } @catch (NSException *e) { /* n vượt số lớp -> bỏ qua */ }
+    } @catch (NSException *e) {}
     return nil;
 }
 
-// ----------------------------------------------------------------------------
-// QR: lưu ảnh cuối cùng / quét QR bằng CIDetector
-// ----------------------------------------------------------------------------
 static NSString *VSLastQRPath(void) {
     return [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:@"VideoStarTool_LastQR.png"];
 }
@@ -273,9 +252,6 @@ static NSString *VSDecodeQR(UIImage *img) {
     return nil;
 }
 
-// ----------------------------------------------------------------------------
-// Hook: bắt lựa chọn media, bắt code vừa nhập, bắt thời điểm import preset xong
-// ----------------------------------------------------------------------------
 static IMP g_origPicked, g_origSelectedCode, g_origImportNew, g_origImportOld, g_origPopupShow;
 static NSUInteger g_importCount;
 static void (^g_pickedHandler)(id editor, id response);
@@ -330,7 +306,7 @@ static BOOL VSReplayPicked(id editor, id response) {
 }
 
 // ============================================================================
-// UI: cửa sổ trong suốt, chỉ nhận chạm ở nút nổi / thanh trạng thái / hộp thoại
+// UI
 // ============================================================================
 @interface VSPassWindow : UIWindow @end
 @implementation VSPassWindow
@@ -340,7 +316,6 @@ static BOOL VSReplayPicked(id editor, id response) {
 }
 @end
 
-// ---- Giao diện thẻ giống bản mẫu: nền xanh đen, viền + chữ cyan
 static UIColor *VSCyan(void) { return [UIColor colorWithRed:0.25 green:0.85 blue:0.96 alpha:1]; }
 static UIColor *VSCardBG(void) { return [UIColor colorWithRed:0.02 green:0.09 blue:0.12 alpha:0.96]; }
 static UIButton *VSOutlineButton(NSString *title, CGRect f) {
@@ -391,11 +366,6 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
 }
 @end
 
-// Delegate giả cho QRCodeManager. Khi người dùng chọn ảnh QR trong bộ chọn gốc "Album Ảnh"
-// (-[QRCodeManager startQRImport]) rồi bấm "Có" ở "Dùng mục này?", Video Star tải preset và gọi
-// delegate.importedData:code:. Delegate này CHỈ ghi nhận (preset, code), không nhập vào đâu cả.
-// Giá trị trả về khớp với MultiLayerWizEffectVC trong binary: codePrefix = "n",
-// validCode: chấp nhận tiền tố "m" (cũ) / "n" (mới), qrLabel = "Multi-Layer" (đã dịch).
 @interface VSQRCaptureDelegate : NSObject
 @property (nonatomic, copy) void (^onCode)(id preset, id code);
 @end
@@ -414,9 +384,8 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
 - (id)qrIcon { return nil; }
 @end
 
-
 // ============================================================================
-// VSTool — điều phối 4 chức năng
+// VSTool
 // ============================================================================
 @interface VSRootVC : UIViewController @end
 
@@ -426,12 +395,12 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UIView *bar;
 @property (nonatomic, strong) VSQRCaptureDelegate *qrCapture;
-@property (nonatomic, strong) NSMutableArray *msPresets;    // preset theo từng phân cảnh (NSNull nếu chưa nhập)
-@property (nonatomic, strong) NSMutableArray *msCodes;      // chuỗi code theo từng phân cảnh
+@property (nonatomic, strong) NSMutableArray *msPresets;
+@property (nonatomic, strong) NSMutableArray *msCodes;
 @property (nonatomic) NSUInteger msStart, msCount, msOrigLast, msRid;
-@property (nonatomic) NSInteger msCapturing;                // chỉ số phân cảnh đang chờ chọn code, -1 = không
+@property (nonatomic) NSInteger msCapturing;
 @property (nonatomic, strong) UIView *msCard;
-@property (nonatomic, copy) NSString *busyName;           // nil = rảnh
+@property (nonatomic, copy) NSString *busyName;
 @property (nonatomic, strong) id savedQRDelegate;
 @property (nonatomic) BOOL savedQRDelegateValid;
 @property (nonatomic, copy) void (^barOK)(void);
@@ -453,7 +422,6 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
     return t;
 }
 
-// ------------------------------- Dựng UI ------------------------------------
 - (void)installIfNeeded {
     if (self.window) return;
     CGRect b = UIScreen.mainScreen.bounds;
@@ -558,8 +526,7 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
     [self hideBar];
     UIView *root = self.window.rootViewController.view;
     CGFloat w = MIN(root.bounds.size.width - 24, 460), h = 132;
-    UIView *bar = [self cardWithFrame:CGRectMake((root.bounds.size.width - w) / 2, root.bounds.size.height - root.safeAreaInsets.bottom - h - 70, w, h)
-                                title:title message:msg];
+    UIView *bar = [self cardWithFrame:CGRectMake((root.bounds.size.width - w) / 2, root.bounds.size.height - root.safeAreaInsets.bottom - h - 70, w, h) title:title message:msg];
     self.barOK = onOK; self.barCancel = onCancel;
     CGFloat bw = (w - 32 - 12) / 2;
     UIButton *c = VSOutlineButton(@"Hủy", CGRectMake(16, h - 52, bw, 38));
@@ -582,7 +549,6 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
     [self hideBar]; if (cb) cb();
 }
 
-// ------------------------------ Menu & trạng thái ---------------------------
 - (void)fabTapped {
     if (self.busyName) {
         UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Đang chạy" message:self.busyName preferredStyle:UIAlertControllerStyleAlert];
@@ -615,7 +581,7 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
 - (void)restoreQRDelegate {
     if (!self.savedQRDelegateValid) return;
     id qr = [NSClassFromString(@"QRCodeManager") respondsToSelector:@selector(sharedInstance)] ? [NSClassFromString(@"QRCodeManager") sharedInstance] : nil;
-    @try { [qr setDelegate:self.savedQRDelegate]; } @catch (...) {}
+    VSSetQRDelegate(qr, self.savedQRDelegate);
     self.savedQRDelegate = nil; self.savedQRDelegateValid = NO;
 }
 
@@ -635,8 +601,7 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
 }
 
 // ============================================================================
-// CHỨC NĂNG 1 — Auto nhập ảnh vào các lớp hình ảnh
-//   Bạn chọn 1 ảnh/video trong bộ chọn gốc -> tool áp dụng cho mọi lớp cùng loại.
+// CHỨC NĂNG 1
 // ============================================================================
 - (void)pickMediaOnEditor:(id)editor rid:(NSUInteger)rid completion:(void (^)(id resp, NSDictionary *info))done {
     if (!g_origPicked) { done(nil, nil); return; }
@@ -663,7 +628,6 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
     });
 }
 
-// Thay media ở các lớp: chọn lớp -> phát lại response gốc -> xác minh lớp đã đổi
 - (void)applyResponse:(id)resp toEditor:(id)editor kind:(NSString *)kind skip:(NSInteger)skip rid:(NSUInteger)rid
            completion:(void (^)(NSUInteger changed, NSUInteger total))done {
     id engine = [editor getMultiLayerEngine];
@@ -691,8 +655,6 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
         }
         NSUInteger n = targets[idx++].unsignedIntegerValue;
         [self status:[NSString stringWithFormat:@"Đang thay media: lớp %lu (%lu/%lu)", (unsigned long)(n + 1), (unsigned long)idx, (unsigned long)total]];
-        // Chọn lớp bằng ĐÚNG MỘT lệnh; chỉ dùng lệnh thứ hai nếu lệnh đầu chưa có hiệu lực.
-        // (Gọi cả hai liên tiếp = chạm hai lần vào nút lớp => Video Star bật menu sửa lớp.)
         @try { [editor selectLayer:n bordered:NO]; }
         @catch (NSException *e) { VSLog(@"select layer %lu exception: %@", (unsigned long)n, e.reason ?: e.name); step(); return; }
         VSPoll(rid, 30, 10, ^BOOL{ return [editor lastSelectedLayerNum] == (NSInteger)n; }, ^(BOOL selected) {
@@ -702,9 +664,6 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
                 id layer = [engine layerAtLayerNum:n];
                 if (!layer || [editor lastSelectedLayerNum] != (NSInteger)n) { VSLog(@"layer %lu: không chọn được", (unsigned long)n); step(); return; }
                 id before = VSGenMedia(layer);
-                // Phát lại đúng lựa chọn ảnh/video cho lớp đang chọn.
-                // KHÔNG gọi presentMLLayerButtons…EditTitleView…: hàm đó mở menu/bảng "Sửa tiêu đề"
-                // và làm Video Star văng khi pickedWithClipPickerResponse: chạy chồng lên nó.
                 VSReplayPicked(editor, resp);
                 VSPoll(rid, 45, 24, ^BOOL{
                     id now = VSGenMedia([engine layerAtLayerNum:n]);
@@ -734,7 +693,7 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
 }
 
 // ============================================================================
-// CHỨC NĂNG 2 — Hiển thị code gần nhất từng nhập
+// CHỨC NĂNG 2
 // ============================================================================
 - (void)runLastCode {
     UIImage *img = VSLoadLastQR();
@@ -783,8 +742,7 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
 }
 
 // ============================================================================
-// CHỨC NĂNG 3 — Auto chia beat
-//   splitView.hasNextBeat -> jumpToNextBeat -> chờ playhead nhảy -> setSplitPoint -> ... -> doSplit
+// CHỨC NĂNG 3 (đã fix currentTime)
 // ============================================================================
 - (void)runBeatSplit {
     id vc = VSFindVC(@"VideoReviewEditVC");
@@ -828,7 +786,7 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
     NSUInteger sceneBefore = [project sceneCount];
     @try {
         if (![sv beatModeOn]) [sv toggleBeatMode];
-        [sv gotoTime:kCMTimeZero];                       // bắt đầu từ đầu phân cảnh
+        [sv gotoTime:kCMTimeZero];
     } @catch (NSException *e) { [self endRun:[NSString stringWithFormat:@"Không bật được chế độ beat: %@", e.reason ?: e.name]]; return; }
 
     __block NSUInteger guard = 0, queued = 0;
@@ -844,21 +802,21 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
         [self status:@"Đang chia phân cảnh…"];
         VSPoll(rid, 100, 150, ^BOOL{ return [project sceneCount] > sceneBefore; }, ^(BOOL ok) {
             [self endRun:ok ? [NSString stringWithFormat:@"Chia beat thành công: thêm %lu phân cảnh.", (unsigned long)([project sceneCount] - sceneBefore)]
-                            : @"Video Star chưa hoàn tất thao tác chia. Hãy kiểm tra lại phân cảnh (có thể đang chờ bạn xác nhận)."];
+                            : @"Video Star chưa hoàn tất thao tác chia."];
         });
     };
 
     step = ^{
         if (rid != g_run) { step = nil; return; }
         if (++guard >= 4096 || ![sv hasNextBeat]) { finish(); return; }
-        CMTime from = [sv currentTime];
+        CMTime from = VSCurrentTime(sv);                 // ✅ FIX
         [sv jumpToNextBeat];
         VSPoll(rid, 12, 100, ^BOOL{
-            CMTime cur = [sv currentTime];
+            CMTime cur = VSCurrentTime(sv);              // ✅ FIX
             return CMTIME_IS_VALID(cur) && (CMTIME_IS_INVALID(from) || CMTimeCompare(cur, from) > 0);
         }, ^(BOOL moved) {
-            CMTime cur = [sv currentTime];
-            if (!moved || (CMTIME_IS_VALID(last) && CMTimeCompare(cur, last) <= 0)) { finish(); return; }   // hết beat
+            CMTime cur = VSCurrentTime(sv);              // ✅ FIX
+            if (!moved || (CMTIME_IS_VALID(last) && CMTimeCompare(cur, last) <= 0)) { finish(); return; }
             last = cur;
             [sv setSplitPoint];
             queued++;
@@ -866,20 +824,11 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
             VSAfter(15, ^{ step(); });
         });
     };
-    VSAfter(220, ^{ step(); });   // chờ UI beat bật xong
+    VSAfter(220, ^{ step(); });
 }
 
 // ============================================================================
-// CHỨC NĂNG 4 — Auto nhập code + ảnh vào các phân cảnh   (đúng luồng của bản mẫu)
-//   1. Bấm VS -> mục 4. Video Star mở "Hợp nhất phân cảnh"; hộp "Chọn phân cảnh":
-//      chọn Cài đặt Đầu / Cài đặt Cuối rồi bấm "Bắt đầu".
-//   2. Bảng "Nhập code": mỗi phân cảnh một nút "Nhập code". Bấm -> bộ chọn gốc "Album Ảnh"
-//      (QRCodeManager -startQRImport) -> chọn ảnh QR -> "Có" ở "Dùng mục này?" -> "Đang xử lý…".
-//      Tool chỉ nhận (preset, code) qua delegate giả; nút đổi thành "Đổi code".
-//   3. Đủ code -> "Chọn ảnh/video": mở Nhiều lớp của phân cảnh đầu, chọn media ở bộ chọn gốc.
-//   4. Bảng "Đang áp dụng": mỗi phân cảnh: mở Nhiều lớp -> editor.importedData:code: ->
-//      tự bấm "Trùng khớp" + "OK" -> thay media mọi lớp -> bấm "Tạo" -> sang phân cảnh kế.
-//   5. "Áp dụng thành công — Đã áp dụng N code cho N phân cảnh."
+// CHỨC NĂNG 4
 // ============================================================================
 - (void)runMultiScene {
     id vc = VSFindVC(@"VideoReviewEditVC");
@@ -903,7 +852,7 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
     NSInteger last  = [VSValue(vc, @"lastScene") integerValue];
     if (!project || start < 0 || last < start || last >= total) {
         @try { [vc closeMergePanel]; } @catch (...) {}
-        [self endRun:@"Chưa chọn được phạm vi hợp lệ. Hãy chọn lại trong Hợp nhất phân cảnh."];
+        [self endRun:@"Chưa chọn được phạm vi hợp lệ."];
         return;
     }
     @try { [vc closeMergePanel]; } @catch (...) {}
@@ -914,7 +863,6 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
     [self msShowCodePanel];
 }
 
-// ---- Bảng "Nhập code"
 - (NSUInteger)msGotCount {
     NSUInteger got = 0;
     for (id c in self.msCodes) if (c != NSNull.null) got++;
@@ -973,7 +921,6 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
 
 - (void)msCancelTapped { [self stopRunQuiet]; }
 
-// Quay lại bảng khi người dùng huỷ bộ chọn gốc (bấm VS -> "Quay lại bảng nhập code")
 - (void)msBackToCodePanel {
     g_pickedHandler = nil;
     [self restoreQRDelegate];
@@ -982,7 +929,6 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
     if (self.msCard && self.msCount) [self msShowCodePanel];
 }
 
-// "Nhập code": mở bộ chọn Album Ảnh gốc, chỉ để lấy (preset, code)
 - (void)codeButtonTapped:(UIButton *)b {
     NSUInteger idx = (NSUInteger)b.tag;
     Class qc = NSClassFromString(@"QRCodeManager");
@@ -1004,8 +950,8 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
     self.qrCapture = cap; self.msCapturing = (NSInteger)idx;
     if (!self.savedQRDelegateValid) { self.savedQRDelegate = VSValue(qr, @"delegate"); self.savedQRDelegateValid = YES; }
     @try {
-        [qr setDelegate:cap];
-        self.msCard.hidden = YES;                 // nhường màn hình cho bộ chọn gốc
+        VSSetQRDelegate(qr, cap);                 // ✅ FIX
+        self.msCard.hidden = YES;
         [qr startQRImport];
     } @catch (NSException *e) {
         [self msBackToCodePanel];
@@ -1013,7 +959,6 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
     }
 }
 
-// ---- Chọn 1 ảnh/video dùng chung (mở Nhiều lớp của phân cảnh đầu)
 - (void)msChooseMediaTapped {
     NSUInteger rid = self.msRid;
     if (rid != g_run || [self msGotCount] != self.msCount) return;
@@ -1033,7 +978,6 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
     }];
 }
 
-// ---- Bảng "Đang áp dụng"
 - (void)msShowApplyPanel {
     UIView *root = self.window.rootViewController.view;
     CGFloat w = MIN(root.bounds.size.width - 24, 460), h = 132;
@@ -1087,7 +1031,6 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
     sceneStep();
 }
 
-// Mở Nhiều lớp của phân cảnh `scene`; trả về editor đúng phân cảnh
 - (void)openEditorForScene:(NSUInteger)scene review:(id)rvc rid:(NSUInteger)rid completion:(void (^)(id editor))done {
     id (^current)(void) = ^id{
         id ed = VSFindVC(@"MultiLayerWizEffectVC");
@@ -1103,8 +1046,6 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
     VSPoll(rid, 80, 100, ^BOOL{ return current() != nil; }, ^(BOOL ok) { done(ok ? current() : nil); });
 }
 
-// Nhập preset đã nhận bằng CHÍNH hàm Video Star gọi khi bạn nhập QR trong Nhiều lớp:
-// -[MultiLayerWizEffectVC importedData:code:]. Rồi tự bấm popup "Trùng khớp" / "OK".
 - (void)importPreset:(id)preset code:(id)code intoEditor:(id)editor rid:(NSUInteger)rid completion:(void (^)(NSString *err))done {
     if (![editor respondsToSelector:@selector(importedData:code:)]) { done(@"Editor không có hàm nhập code."); return; }
     NSUInteger snap = g_importCount;
@@ -1119,7 +1060,7 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
     }, ^(BOOL ok) {
         if (blocked) { done(@"Video Star hiện popup yêu cầu mua gói — tool không tự bấm. Dừng."); return; }
         if (!ok) { done(@"Code chưa được Video Star nhập xong (hết thời gian chờ)."); return; }
-        VSAfter(700, ^{   // chờ preset dựng xong, bấm nốt popup còn lại
+        VSAfter(700, ^{
             id engine = [editor getMultiLayerEngine];
             VSPoll(rid, 60, 80, ^BOOL{
                 VSHandleEditorPopups(editor);
@@ -1129,7 +1070,6 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
     });
 }
 
-// Bấm nút Tạo gốc rồi chờ editor đóng (render có thể lâu: tối đa 60 giây)
 - (void)createInEditor:(id)editor rid:(NSUInteger)rid completion:(void (^)(NSString *err))done {
     BOOL fired = NO;
     id item = VSValue(editor, @"createBarButton");
@@ -1156,7 +1096,7 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
 @end
 
 // ============================================================================
-// Entry point
+// Entry
 // ============================================================================
 static void VSBootstrap(void) {
     if (!NSClassFromString(@"MultiLayerWizEffectVC")) { VSLog(@"không phải Video Star, bỏ qua"); return; }
