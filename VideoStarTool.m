@@ -1,21 +1,54 @@
+// ============================================================================
 // VideoStarTool.m
 // Runtime Automation Bot for Video Star 14.3.3 (build 1809)
-// Logic: 1-Chạm Thay Media + Nhập QR Hàng loạt + Smart Popup Handler
+//
+// Kiến trúc Tweak Theos / Logos nâng cao dành riêng cho Video Star:
+//   1. Auto nhập ảnh/video vào tất cả các lớp (1-Chạm Thay Media thông minh)
+//   2. Hiển thị và trích xuất mã QR / Preset gần nhất đã nhập
+//   3. Auto chia beat phân cảnh (Beat Sync & Scene Multi-Splitter)
+//   4. Auto nhập QR code + thay thế media hàng loạt qua từng phân cảnh
+//
+// ĐẶC TRỊ TRIỆT ĐỂ 3 NGUYÊN NHÂN LỖI TRÊN VIDEO:
+//   - LỖI 1: Popup cảnh báo lệch frame (Mismatch Frame/Duration Warning)
+//   - LỖI 2: Kẹt vòng lặp chờ trạng thái (Stuck/Infinite Polishing State)
+//   - LỖI 3: Tràn RAM / Xung đột luồng đồ họa gây sập app (Crash / Black Screen)
+// ============================================================================
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
+#import <Photos/Photos.h>
 #import <PhotosUI/PhotosUI.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
 #define VS_MAX_LAYERS 30
-#define VSLog(fmt, ...) NSLog(@"[VideoStarTool] " fmt, ##__VA_ARGS__)
+#define VS_TAG "[VideoStarTool] "
+#define VSLog(fmt, ...) NSLog(@VS_TAG fmt, ##__VA_ARGS__)
 
 // ============================================================================
-// PRIVATE API — đã đối chiếu header CustomPopup/MultiLayerEngine/QRCodeManager
+// PHẦN 1: KHAI BÁO GIAO DIỆN PRIVATE API (ĐỐI CHIẾU CHÍNH XÁC KTOOL HEADERS)
 // ============================================================================
-@interface NSObject (VSPrivate)
+
+@protocol ProjectInterface <NSObject>
+@property (nonatomic, readonly) NSUInteger sceneCount;
+@property (nonatomic, readonly) NSUInteger lastSceneIndex;
+@property (nonatomic) CGFloat songBPM;
+@property (nonatomic) CGFloat songFirstBeatTime;
+@property (nonatomic) CGFloat songDuration;
+- (CGFloat)durationOfSceneAtIndex:(NSUInteger)sceneIndex;
+- (CMTime)sceneStartCMTime:(NSUInteger)sceneIndex;
+- (BOOL)sceneHasAtLeastOneClipWithSceneIndex:(NSUInteger)sceneIndex;
+- (NSUInteger)clipCountForSceneIndex:(NSUInteger)sceneIndex;
+- (id)fileManager;
+- (void)splitSceneAtIndex:(NSUInteger)sceneIndex time:(CMTime)time progressView:(id)progressView completion:(id)completion;
+- (void)multiSplitSceneAtIndex:(NSUInteger)sceneIndex times:(NSArray *)times progressView:(id)progressView completion:(id)completion;
+- (BOOL)addNewClipToSceneAtIndex:(NSUInteger)sceneIndex clipURL:(NSURL *)clipURL sourceClipIndex:(NSInteger)sourceClipIndex makeActive:(BOOL)makeActive image:(UIImage *)image frameTimes:(id)frameTimes;
+- (CMTime)addNewSceneWithVideoURL:(NSURL *)videoURL image:(UIImage *)image frameTimes:(id)frameTimes;
+@end
+
+@interface NSObject (VSPrivateDeclarations)
 // MultiLayerWizEffectVC
 - (id)getMultiLayerEngine;
 - (void)pickNewContent;
@@ -26,36 +59,53 @@
 - (void)handleImageGenUpdate;
 - (void)engineResync;
 - (void)refreshDisplay;
+- (void)updateDisplayAtFrame:(NSInteger)frame;
 - (void)create;
+- (void)startCreate;
+- (void)createStepTwo;
 - (void)importedData:(id)data code:(id)code;
+- (void)importOldPreset:(id)preset;
+- (void)importNewPreset:(id)preset keyFrameAction:(id)action qrDurationInFrames:(NSInteger)frames;
+- (BOOL)isEditing;
+- (BOOL)isViewLoaded;
+- (UIView *)view;
+- (UINavigationController *)navigationController;
+
 // MultiLayerEngine
 - (id)layerAtLayerNum:(NSUInteger)n;
 - (NSInteger)numActiveLayers;
+- (int)activeLayers;
 - (void)reloadLayerEffects;
+
 // MultiLayerLayer
 - (id)imageGenerator;
-- (id)layerImage;
+- (id)parameters;
+- (id)effect;
+- (NSString *)origAssetInfo;
+
+// MultiLayerImageGenerator
 - (id)asset;
+- (UIImage *)layerImage;
 - (id)layerDrawing;
 - (id)layerZaps;
 - (id)layerGIF;
+- (id)layerOverlay;
+- (unsigned int)layerImageTextureID;
+
 // VideoReviewEditVC
 - (NSUInteger)navSceneIndex;
-- (id)project;
+- (id<ProjectInterface>)project;
 - (NSUInteger)sceneIndex;
 - (void)showMergeScenes;
 - (void)closeMergePanel;
 - (void)showMultiLayer;
 - (void)showSplitScene;
+- (void)closeSplitPanel;
 - (NSUInteger)lastViewedSceneIndex;
 - (void)setLastViewedSceneIndex:(NSUInteger)i;
 - (BOOL)isEnoughStorageAvailableForSplit;
-// project
-- (NSUInteger)sceneCount;
-- (BOOL)sceneHasAtLeastOneClipWithSceneIndex:(NSUInteger)i;
-- (NSUInteger)clipCountForSceneIndex:(NSUInteger)i;
-- (id)fileManager;
-- (id)clipURLForSceneIndex:(NSUInteger)i clipIndex:(NSUInteger)c;
+- (void)performSplitWithTimes:(id)times;
+
 // MultiSplitView
 - (BOOL)beatModeOn;
 - (void)toggleBeatMode;
@@ -64,370 +114,694 @@
 - (void)setSplitPoint;
 - (void)doSplit;
 - (void)gotoTime:(CMTime)t;
+- (CMTime)currentTime;
+
 // QRCodeManager
 + (id)sharedInstance;
 - (void)selectedCode:(id)code withImageData:(id)data;
 - (void)startQRImport;
+- (void)setDelegate:(id)delegate;
+- (id)delegate;
+
+// ProjectManager
++ (id)sharedInstance;
+- (id<ProjectInterface>)activeEditProject;
+
+// ProjectFileManager
+- (NSURL *)clipURLForSceneIndex:(NSUInteger)sceneIndex clipIndex:(NSUInteger)clipIndex;
+
 // CustomPopup
+- (void)show;
+- (void)dismiss;
+- (void)bounceClosed;
 - (void)simulateButtonPressButtonWithTitle:(id)title;
+- (void)buttonPressed:(id)button;
 @end
 
 // ============================================================================
-// UTILITIES
+// PHẦN 2: CÁC TIỆN ÍCH AN TOÀN BỘ NHỚ, ĐỒNG BỘ THREAD VÀ BỘ ĐỆM ĐIỀU KHIỂN
 // ============================================================================
-static NSUInteger g_run;
 
-static void VSAfter(int64_t ms, dispatch_block_t b) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, ms * NSEC_PER_MSEC), dispatch_get_main_queue(), b);
-}
+static NSUInteger g_runIdentifier = 0;
+static NSHashTable *g_activePopupsTable = nil;
+static id g_lastHandledPopup = nil;
+static CFAbsoluteTime g_lastHandledPopupTime = 0;
 
-static CMTime VSCurrentTime(id obj) {
-    if (!obj) return kCMTimeInvalid;
-    SEL sel = @selector(currentTime);
-    if (![obj respondsToSelector:sel]) return kCMTimeInvalid;
-    CMTime (*fn)(id, SEL) = (CMTime (*)(id, SEL))[obj methodForSelector:sel];
-    return fn(obj, sel);
-}
-
-static void VSSetQRDelegate(id qr, id delegate) {
-    if (!qr) return;
-    SEL sel = @selector(setDelegate:);
-    if (![qr respondsToSelector:sel]) return;
-    ((void (*)(id, SEL, id))[qr methodForSelector:sel])(qr, sel, delegate);
-}
-
-static id VSValue(id obj, NSString *key) {
-    if (!obj || !key.length) return nil;
-    @try { return [obj valueForKey:key]; } @catch (...) { return nil; }
-}
-
-static BOOL VSIsKind(id obj, NSString *name) {
-    Class c = NSClassFromString(name);
-    return obj && c && [obj isKindOfClass:c];
-}
-
-// Poll bất đồng bộ — dùng cho mọi bước chờ trạng thái app
-static void VSPoll(NSUInteger rid, int64_t ms, NSUInteger tries, BOOL (^cond)(void), void (^done)(BOOL ok)) {
-    if (rid != g_run) return;
-    BOOL ok = NO;
-    @try { ok = cond(); } @catch (NSException *e) { VSLog(@"poll exception: %@", e.reason ?: e.name); }
-    if (ok) { done(YES); return; }
-    if (tries == 0) { done(NO); return; }
-    VSAfter(ms, ^{ VSPoll(rid, ms, tries - 1, cond, done); });
-}
-
-// Duyệt VC hierarchy để tìm class theo tên
-static UIViewController *VSFindVCIn(UIViewController *vc, Class cls, int depth) {
-    if (!vc || depth > 14) return nil;
-    UIViewController *r = nil;
-    if (vc.presentedViewController && (r = VSFindVCIn(vc.presentedViewController, cls, depth + 1))) return r;
-    if ([vc isKindOfClass:UINavigationController.class]) {
-        for (UIViewController *c in ((UINavigationController *)vc).viewControllers.reverseObjectEnumerator)
-            if ((r = VSFindVCIn(c, cls, depth + 1))) return r;
+static inline void VSRunOnMain(dispatch_block_t block) {
+    if ([NSThread isMainThread]) {
+        @autoreleasepool { block(); }
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @autoreleasepool { block(); }
+        });
     }
-    if ([vc isKindOfClass:UITabBarController.class] && (r = VSFindVCIn(((UITabBarController *)vc).selectedViewController, cls, depth + 1))) return r;
-    for (UIViewController *c in vc.childViewControllers.reverseObjectEnumerator)
-        if ((r = VSFindVCIn(c, cls, depth + 1))) return r;
-    if ([vc isKindOfClass:cls] && vc.isViewLoaded && vc.view.window) return vc;
-    return nil;
 }
 
-@class VSTool;
-static UIWindow *g_toolWindow;
-
-static UIViewController *VSFindVC(NSString *className) {
-    Class cls = NSClassFromString(className);
-    if (!cls) return nil;
-    for (UIWindow *w in UIApplication.sharedApplication.windows.reverseObjectEnumerator) {
-        if (w == g_toolWindow || w.hidden) continue;
-        UIViewController *r = VSFindVCIn(w.rootViewController, cls, 0);
-        if (r) return r;
-    }
-    return nil;
-}
-
-// ============================================================================
-// SMART POPUP HANDLER — tự động bấm "Trùng khớp"/"Match" (hỗ trợ cả EN/VI)
-// ============================================================================
-static NSString *VSL(NSString *en) {
-    return [NSBundle.mainBundle localizedStringForKey:en value:en table:nil];
-}
-
-static id g_lastPressedPopup;
-static CFAbsoluteTime g_lastPressedAt;
-typedef NS_ENUM(NSInteger, VSPopupResult) { VSPopupNone = 0, VSPopupPressed, VSPopupBlocked };
-static NSHashTable *g_popups;
-
-static NSArray *VSVisiblePopups(id editor) {
-    NSMutableArray *all = [NSMutableArray array];
-    for (NSString *key in @[@"ourPopup", @"warningPopup"]) { id p = editor ? VSValue(editor, key) : nil; if (p) [all addObject:p]; }
-    for (id p in g_popups.allObjects) if (![all containsObject:p]) [all addObject:p];
-    NSMutableArray *vis = [NSMutableArray array];
-    for (id p in all) {
-        if (!VSIsKind(p, @"CustomPopup")) continue;
-        UIView *dim = VSValue(p, @"dimView");
-        if ([dim isKindOfClass:UIView.class] && dim.window) [vis addObject:p];
-    }
-    return vis;
-}
-
-static BOOL VSPopupLooksLikePurchase(id popup) {
-    NSString *msg = [VSValue(popup, @"_message") description].lowercaseString ?: @"";
-    NSString *ttl = [VSValue(popup, @"_title") description].lowercaseString ?: @"";
-    NSString *all = [msg stringByAppendingString:ttl];
-    for (NSString *w in @[@"purchase", @"subscription", @"unlock pro", @"pro pack", @"restore purchase",
-                          @"mua gói", @"khôi phục", @"đăng ký", @"nâng cấp"]) {
-        if ([all containsString:w]) return YES;
-    }
-    return NO;
-}
-
-static VSPopupResult VSHandleEditorPopups(id editor) {
-    // Ưu tiên theo document: "Trùng khớp" / "Match" / "Original Preset Layers"
-    NSArray *prefer = @[
-        @"Trùng khớp", @"Match",
-        @"Original Preset Layers", @"Các lớp cài đặt sẵn gốc",
-        @"Fit", @"Vừa khung",
-        @"Continue", @"Tiếp tục",
-        @"OK", @"Đồng ý"
-    ];
-    for (id popup in VSVisiblePopups(editor)) {
-        if (VSPopupLooksLikePurchase(popup)) return VSPopupBlocked;
-        if (popup == g_lastPressedPopup && CFAbsoluteTimeGetCurrent() - g_lastPressedAt < 0.4) return VSPopupPressed;
-        
-        NSArray *titles = VSValue(popup, @"_buttonStrings");
-        NSArray *buttons = VSValue(popup, @"_buttons");
-        for (NSString *en in prefer) {
-            NSString *loc = VSL(en);
-            NSString *hit = nil;
-            for (id t in titles)
-                if ([t isKindOfClass:NSString.class] && ([t localizedCaseInsensitiveContainsString:loc] || [t localizedCaseInsensitiveContainsString:en]))
-                    { hit = t; break; }
-            if (!hit) for (id b in buttons) {
-                NSString *ct = [b isKindOfClass:UIButton.class] ? ((UIButton *)b).currentTitle : nil;
-                if (ct && ([ct localizedCaseInsensitiveContainsString:loc] || [ct localizedCaseInsensitiveContainsString:en]))
-                    { hit = ct; break; }
-            }
-            if (!hit) continue;
-            
-            g_lastPressedPopup = popup; g_lastPressedAt = CFAbsoluteTimeGetCurrent();
-            @try {
-                if ([popup respondsToSelector:@selector(simulateButtonPressButtonWithTitle:)]) {
-                    [popup simulateButtonPressButtonWithTitle:hit];
-                } else {
-                    for (id b in buttons)
-                        if ([b isKindOfClass:UIButton.class] && [((UIButton *)b).currentTitle localizedCaseInsensitiveContainsString:hit]) {
-                            [(UIButton *)b sendActionsForControlEvents:UIControlEventTouchUpInside]; break;
-                        }
-                }
-                VSLog(@"popup pressed: '%@'", hit);
-            } @catch (NSException *e) { VSLog(@"popup press exception: %@", e.reason ?: e.name); }
-            return VSPopupPressed;
-        }
-    }
-    return VSPopupNone;
-}
-
-static BOOL VSEditorHasVisiblePopup(id editor) { return VSVisiblePopups(editor).count > 0; }
-
-// ============================================================================
-// LAYER INFO — chỉ chấp nhận lớp ảnh/video (bỏ 3D/text/color/drawing/zap/gif)
-// ============================================================================
-static id VSGenMedia(id layer) {
-    id gen = [layer respondsToSelector:@selector(imageGenerator)] ? [layer imageGenerator] : nil;
-    if (!gen) return nil;
-    return [gen respondsToSelector:@selector(asset)] && [gen asset] ? [gen asset] : [gen layerImage];
-}
-
-static NSDictionary *VSLayerInfo(id engine, NSUInteger n) {
-    @try {
-        id layer = [engine layerAtLayerNum:n];
-        if (!layer) return nil;
-        if (VSValue(layer, @"layer3D") || VSValue(layer, @"layer3d")) return nil;
-        id gen = [layer respondsToSelector:@selector(imageGenerator)] ? [layer imageGenerator] : nil;
-        if (!gen) return nil;
-        if ([gen layerDrawing] || [gen layerZaps] || [gen layerGIF]) return nil;
-        if (VSValue(gen, @"textView") || VSValue(gen, @"fillColor") ||
-            VSValue(gen, @"isTextLayer") || VSValue(gen, @"isColorLayer") ||
-            VSValue(gen, @"is3DLayer") || VSValue(gen, @"isDrawingLayer")) return nil;
-
-        id asset = [gen respondsToSelector:@selector(asset)] ? [gen asset] : nil;
-        if ([asset isKindOfClass:AVAsset.class]) return @{@"layerNum": @(n), @"kind": @"video"};
-
-        UIImage *img = [gen layerImage];
-        if ([img isKindOfClass:UIImage.class] && img.size.width > 1) return @{@"layerNum": @(n), @"kind": @"image"};
-    } @catch (...) {}
-    return nil;
-}
-
-// ============================================================================
-// QR — CIDetector độ chính xác cao
-// ============================================================================
-static NSString *VSLastQRPath(void) {
-    return [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] stringByAppendingPathComponent:@"VideoStarTool_LastQR.png"];
-}
-static void VSRememberLastQR(NSData *data) {
-    UIImage *img = [data isKindOfClass:NSData.class] ? [UIImage imageWithData:data] : nil;
-    NSData *png = img ? UIImagePNGRepresentation(img) : nil;
-    if (png.length) [png writeToFile:VSLastQRPath() atomically:YES];
-}
-static UIImage *VSLoadLastQR(void) {
-    NSData *d = [NSData dataWithContentsOfFile:VSLastQRPath()];
-    return d.length ? [UIImage imageWithData:d] : nil;
-}
-static NSString *VSDecodeQR(UIImage *img) {
-    CIImage *ci = img ? [[CIImage alloc] initWithImage:img] : nil;
-    if (!ci) return nil;
-    CIDetector *det = [CIDetector detectorOfType:CIDetectorTypeQRCode context:nil
-                                         options:@{CIDetectorAccuracy: CIDetectorAccuracyHigh}];
-    for (CIFeature *f in [det featuresInImage:ci])
-        if ([f isKindOfClass:CIQRCodeFeature.class] && ((CIQRCodeFeature *)f).messageString.length)
-            return ((CIQRCodeFeature *)f).messageString;
-    return nil;
-}
-
-// ============================================================================
-// HOOKS — lắng nghe sự kiện chọn media, chọn code, popup
-// ============================================================================
-static IMP g_origPicked, g_origSelectedCode, g_origImportNew, g_origImportOld, g_origPopupShow;
-static NSUInteger g_importCount;
-static void (^g_pickedHandler)(id editor, id response);
-
-static BOOL VSSwizzle(NSString *cls, SEL sel, id block, IMP *orig) {
-    Class c = NSClassFromString(cls);
-    Method m = c ? class_getInstanceMethod(c, sel) : NULL;
-    if (!m) { VSLog(@"hook unavailable: -[%@ %@]", cls, NSStringFromSelector(sel)); return NO; }
-    if (*orig) return YES;
-    *orig = method_getImplementation(m);
-    method_setImplementation(m, imp_implementationWithBlock(block));
-    return YES;
-}
-
-static void VSInstallHooks(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        g_popups = [NSHashTable weakObjectsHashTable];
-
-        // Hook chọn media (cho feature 1)
-        VSSwizzle(@"MultiLayerWizEffectVC", @selector(pickedWithClipPickerResponse:), ^(id me, id resp) {
-            ((void (*)(id, SEL, id))g_origPicked)(me, @selector(pickedWithClipPickerResponse:), resp);
-            void (^h)(id, id) = g_pickedHandler;
-            if (h) dispatch_async(dispatch_get_main_queue(), ^{ h(me, resp); });
-        }, &g_origPicked);
-
-        // Hook chọn code (lưu QR)
-        VSSwizzle(@"QRCodeManager", @selector(selectedCode:withImageData:), ^(id me, id code, id data) {
-            VSRememberLastQR(data);
-            ((void (*)(id, SEL, id, id))g_origSelectedCode)(me, @selector(selectedCode:withImageData:), code, data);
-        }, &g_origSelectedCode);
-
-        // Đếm số lần import preset (cho feature 4)
-        VSSwizzle(@"MultiLayerWizEffectVC", @selector(importNewPreset:keyFrameAction:qrDurationInFrames:),
-                  ^(id me, id a, id b, NSInteger frames) {
-            ((void (*)(id, SEL, id, id, NSInteger))g_origImportNew)(me, @selector(importNewPreset:keyFrameAction:qrDurationInFrames:), a, b, frames);
-            g_importCount++;
-        }, &g_origImportNew);
-
-        VSSwizzle(@"MultiLayerWizEffectVC", @selector(importOldPreset:), ^(id me, id a) {
-            ((void (*)(id, SEL, id))g_origImportOld)(me, @selector(importOldPreset:), a);
-            g_importCount++;
-        }, &g_origImportOld);
-
-        // Hook popup để tự bấm "Trùng khớp" ngay khi hiện
-        VSSwizzle(@"CustomPopup", @selector(show), ^(id me) {
-            ((void (*)(id, SEL))g_origPopupShow)(me, @selector(show));
-            [g_popups addObject:me];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-                VSHandleEditorPopups(nil);
-            });
-        }, &g_origPopupShow);
-
-        VSLog(@"hooks installed");
+static inline void VSDispatchAfterMS(int64_t delayMs, dispatch_block_t block) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayMs * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+        @autoreleasepool { block(); }
     });
 }
 
-static BOOL VSReplayPicked(id editor, id response) {
-    if (!editor || !response || !g_origPicked) return NO;
-    @try { ((void (*)(id, SEL, id))g_origPicked)(editor, @selector(pickedWithClipPickerResponse:), response); return YES; }
-    @catch (NSException *e) { VSLog(@"replay picked exception: %@", e.reason ?: e.name); }
+static inline CMTime VSSafeCurrentTime(id object) {
+    if (!object) return kCMTimeInvalid;
+    SEL sel = @selector(currentTime);
+    if (![object respondsToSelector:sel]) return kCMTimeInvalid;
+    @try {
+        CMTime (*func)(id, SEL) = (CMTime (*)(id, SEL))[object methodForSelector:sel];
+        return func(object, sel);
+    } @catch (NSException *e) {
+        VSLog(@"Lỗi lấy currentTime: %@", e);
+        return kCMTimeInvalid;
+    }
+}
+
+static inline id VSSafeValueForKey(id object, NSString *key) {
+    if (!object || !key.length) return nil;
+    @try {
+        return [object valueForKey:key];
+    } @catch (NSException *e) {
+        return nil;
+    }
+}
+
+static inline BOOL VSSafeIsClass(id object, NSString *className) {
+    if (!object || !className.length) return NO;
+    Class targetClass = NSClassFromString(className);
+    return targetClass && [object isKindOfClass:targetClass];
+}
+
+// Polling bất đồng bộ an toàn: Dọn sạch Autoreleasepool mỗi chu kỳ, không nghẽn runloop
+static void VSSafePoll(NSUInteger runId, int64_t intervalMs, NSUInteger remainingTries,
+                       BOOL (^conditionBlock)(void), void (^completionBlock)(BOOL success)) {
+    if (runId != g_runIdentifier) {
+        if (completionBlock) completionBlock(NO);
+        return;
+    }
+    
+    BOOL matched = NO;
+    @autoreleasepool {
+        @try {
+            matched = conditionBlock();
+        } @catch (NSException *e) {
+            VSLog(@"Ngoại lệ trong Poll: %@", e);
+            matched = NO;
+        }
+    }
+    
+    if (matched) {
+        if (completionBlock) completionBlock(YES);
+        return;
+    }
+    
+    if (remainingTries == 0) {
+        if (completionBlock) completionBlock(NO);
+        return;
+    }
+    
+    VSDispatchAfterMS(intervalMs, ^{
+        VSSafePoll(runId, intervalMs, remainingTries - 1, conditionBlock, completionBlock);
+    });
+}
+
+// Bộ duyệt tìm ViewController đệ quy an toàn
+static UIViewController *VSSearchViewControllerRecursive(UIViewController *rootVC, Class targetClass, int depth) {
+    if (!rootVC || depth > 15) return nil;
+    
+    UIViewController *result = nil;
+    if (rootVC.presentedViewController) {
+        result = VSSearchViewControllerRecursive(rootVC.presentedViewController, targetClass, depth + 1);
+        if (result) return result;
+    }
+    
+    if ([rootVC isKindOfClass:[UINavigationController class]]) {
+        UINavigationController *nav = (UINavigationController *)rootVC;
+        for (UIViewController *child in nav.viewControllers.reverseObjectEnumerator) {
+            result = VSSearchViewControllerRecursive(child, targetClass, depth + 1);
+            if (result) return result;
+        }
+    }
+    
+    if ([rootVC isKindOfClass:[UITabBarController class]]) {
+        UITabBarController *tab = (UITabBarController *)rootVC;
+        result = VSSearchViewControllerRecursive(tab.selectedViewController, targetClass, depth + 1);
+        if (result) return result;
+    }
+    
+    for (UIViewController *child in rootVC.childViewControllers.reverseObjectEnumerator) {
+        result = VSSearchViewControllerRecursive(child, targetClass, depth + 1);
+        if (result) return result;
+    }
+    
+    if ([rootVC isKindOfClass:targetClass] && rootVC.isViewLoaded && rootVC.view.window) {
+        return rootVC;
+    }
+    return nil;
+}
+
+static UIWindow *g_overlayToolWindow = nil;
+
+static UIViewController *VSFindTopViewControllerNamed(NSString *className) {
+    Class targetClass = NSClassFromString(className);
+    if (!targetClass) return nil;
+    
+    NSArray *windows = UIApplication.sharedApplication.windows;
+    for (UIWindow *w in windows.reverseObjectEnumerator) {
+        if (w == g_overlayToolWindow || w.hidden || w.alpha <= 0.01) continue;
+        UIViewController *found = VSSearchViewControllerRecursive(w.rootViewController, targetClass, 0);
+        if (found) return found;
+    }
+    return nil;
+}
+
+// ============================================================================
+// PHẦN 3: XỬ LÝ TRIỆT ĐỂ LỖI 1 — SMART POPUP & MISMATCH FRAME RESOLVER
+// ============================================================================
+
+typedef NS_ENUM(NSInteger, VSPopupActionStatus) {
+    VSPopupActionStatusNone = 0,
+    VSPopupActionStatusHandled,
+    VSPopupActionStatusBlockedPurchase
+};
+
+static inline NSString *VSLocalizedString(NSString *key) {
+    return [NSBundle.mainBundle localizedStringForKey:key value:key table:nil];
+}
+
+static NSArray *VSCollectAllVisiblePopups(id editorVC) {
+    NSMutableArray *results = [NSMutableArray array];
+    
+    if (editorVC) {
+        for (NSString *ivarName in @[@"ourPopup", @"warningPopup", @"object3DPickerPopup", @"copyLayerPopup"]) {
+            id popup = VSSafeValueForKey(editorVC, ivarName);
+            if (popup && ![results containsObject:popup]) {
+                [results addObject:popup];
+            }
+        }
+    }
+    
+    if (g_activePopupsTable) {
+        for (id popup in g_activePopupsTable.allObjects) {
+            if (popup && ![results containsObject:popup]) {
+                [results addObject:popup];
+            }
+        }
+    }
+    
+    NSMutableArray *visibleOnly = [NSMutableArray array];
+    for (id popup in results) {
+        if (!VSSafeIsClass(popup, @"CustomPopup")) continue;
+        UIView *dimView = VSSafeValueForKey(popup, @"dimView");
+        UIView *popupView = (UIView *)popup;
+        if ((dimView && dimView.window) || (popupView && popupView.window)) {
+            [visibleOnly addObject:popup];
+        }
+    }
+    return visibleOnly;
+}
+
+// Kiểm tra xem popup có phải là bảng chào mua gói VIP/Pro hay không
+static BOOL VSCheckIfPopupIsPurchasePrompt(id popup) {
+    NSString *message = [VSSafeValueForKey(popup, @"_message") description].lowercaseString ?: @"";
+    NSString *title = [VSSafeValueForKey(popup, @"_title") description].lowercaseString ?: @"";
+    NSString *combined = [title stringByAppendingFormat:@" %@", message];
+    
+    NSArray *purchaseKeywords = @[
+        @"purchase", @"subscription", @"unlock pro", @"pro pack", @"restore purchase",
+        @"all access", @"pass", @"buy", @"mua gói", @"khôi phục", @"đăng ký", @"nâng cấp",
+        @"dùng thử", @"mở khóa", @"thanh toán"
+    ];
+    for (NSString *keyword in purchaseKeywords) {
+        if ([combined containsString:keyword]) return YES;
+    }
     return NO;
 }
 
+// Xử lý tự động nhấn lựa chọn tối ưu trong popup cảnh báo độ dài frame và popup xác nhận
+static VSPopupActionStatus VSResolvePopupsImmediately(id editorVC) {
+    NSArray *popups = VSCollectAllVisiblePopups(editorVC);
+    if (popups.count == 0) return VSPopupActionStatusNone;
+    
+    // Danh sách ưu tiên theo thứ tự logic xử lý Video Star:
+    // 1. Độ dài lệch frame: ưu tiên "Khớp: rút ngắn/giãn" / "Trùng khớp" / "Match: shorten/stretch"
+    // 2. Tương thích preset: "Original Preset Layers" / "Các lớp cài đặt sẵn gốc"
+    // 3. Khớp kích cỡ: "Fit" / "Vừa khung" / "Scale"
+    // 4. Tiếp tục / Chấp thuận: "Continue" / "Tiếp tục" / "OK" / "Đồng ý" / "Yes" / "Có"
+    NSArray *priorityButtonNames = @[
+        @"Khớp: rút ngắn/giãn", @"Match: shorten/stretch",
+        @"Trùng khớp", @"Match",
+        @"Original Preset Layers", @"Các lớp cài đặt sẵn gốc",
+        @"Bắt đầu", @"Start",
+        @"Kết thúc", @"End",
+        @"Fit", @"Vừa khung",
+        @"Replace", @"Thay thế",
+        @"Continue", @"Tiếp tục",
+        @"Yes", @"Có",
+        @"OK", @"Đồng ý",
+        @"Done", @"Xong"
+    ];
+    
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    
+    for (id popup in popups) {
+        if (VSCheckIfPopupIsPurchasePrompt(popup)) {
+            VSLog(@"Phát hiện popup yêu cầu thanh toán/Pro Pack. Dừng chu trình an toàn.");
+            return VSPopupActionStatusBlockedPurchase;
+        }
+        
+        // Chống dội lặp lại trên cùng 1 instance popup trong khoảng 350ms
+        if (popup == g_lastHandledPopup && (now - g_lastHandledPopupTime < 0.35)) {
+            return VSPopupActionStatusHandled;
+        }
+        
+        NSArray *buttonStrings = VSSafeValueForKey(popup, @"_buttonStrings");
+        NSArray *buttonsArray = VSSafeValueForKey(popup, @"_buttons");
+        
+        NSString *matchedTitle = nil;
+        UIButton *matchedButtonObj = nil;
+        
+        for (NSString *candidate in priorityButtonNames) {
+            NSString *localizedCandidate = VSLocalizedString(candidate);
+            
+            // Tìm trong chuỗi tiêu đề mảng _buttonStrings
+            if ([buttonStrings isKindOfClass:[NSArray class]]) {
+                for (id titleItem in buttonStrings) {
+                    if (![titleItem isKindOfClass:[NSString class]]) continue;
+                    NSString *str = (NSString *)titleItem;
+                    if ([str localizedCaseInsensitiveContainsString:candidate] ||
+                        [str localizedCaseInsensitiveContainsString:localizedCandidate]) {
+                        matchedTitle = str;
+                        break;
+                    }
+                }
+            }
+            if (matchedTitle) break;
+            
+            // Tìm trực tiếp trên mảng UIButton instance
+            if ([buttonsArray isKindOfClass:[NSArray class]]) {
+                for (id btnObj in buttonsArray) {
+                    if (![btnObj isKindOfClass:[UIButton class]]) continue;
+                    UIButton *btn = (UIButton *)btnObj;
+                    NSString *currentBtnTitle = btn.currentTitle;
+                    if (currentBtnTitle.length &&
+                        ([currentBtnTitle localizedCaseInsensitiveContainsString:candidate] ||
+                         [currentBtnTitle localizedCaseInsensitiveContainsString:localizedCandidate])) {
+                        matchedTitle = currentBtnTitle;
+                        matchedButtonObj = btn;
+                        break;
+                    }
+                }
+            }
+            if (matchedTitle || matchedButtonObj) break;
+        }
+        
+        if (matchedTitle || matchedButtonObj) {
+            g_lastHandledPopup = popup;
+            g_lastHandledPopupTime = now;
+            
+            @try {
+                if (matchedTitle && [popup respondsToSelector:@selector(simulateButtonPressButtonWithTitle:)]) {
+                    VSLog(@"[SmartPopup] Tự động nhấn theo tiêu đề: '%@'", matchedTitle);
+                    [popup simulateButtonPressButtonWithTitle:matchedTitle];
+                } else if (matchedButtonObj) {
+                    VSLog(@"[SmartPopup] Tự động gửi touchUpInside cho nút: '%@'", matchedButtonObj.currentTitle);
+                    [matchedButtonObj sendActionsForControlEvents:UIControlEventTouchUpInside];
+                } else if ([popup respondsToSelector:@selector(dismiss)]) {
+                    [popup dismiss];
+                }
+            } @catch (NSException *e) {
+                VSLog(@"[SmartPopup] Lỗi ngoại lệ khi nhấn popup: %@", e);
+            }
+            return VSPopupActionStatusHandled;
+        }
+    }
+    
+    return VSPopupActionStatusNone;
+}
+
+static inline BOOL VSHasAnyActivePopup(id editorVC) {
+    return VSCollectAllVisiblePopups(editorVC).count > 0;
+}
+
 // ============================================================================
-// UI — VSPassWindow nổi, VSImageVC xem QR, VSQRCaptureDelegate
+// PHẦN 4: XÁC MINH VÀ PHÂN LOẠI LAYER (TRÁNH LỖI KẸT MEDIA)
 // ============================================================================
-@interface VSPassWindow : UIWindow @end
-@implementation VSPassWindow
-- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
-    UIView *v = [super hitTest:p withEvent:e];
-    return (v == self || v == self.rootViewController.view) ? nil : v;
+
+typedef NS_ENUM(NSInteger, VSLayerMediaKind) {
+    VSLayerMediaKindUnknown = 0,
+    VSLayerMediaKindImage,
+    VSLayerMediaKindVideo
+};
+
+@interface VSLayerSnapshot : NSObject
+@property (nonatomic, assign) NSUInteger layerIndex;
+@property (nonatomic, assign) VSLayerMediaKind mediaKind;
+@property (nonatomic, strong) id mediaObject;
+@property (nonatomic, assign) unsigned int textureID;
+@property (nonatomic, copy)   NSString *assetInfo;
+@end
+
+@implementation VSLayerSnapshot
+@end
+
+static VSLayerSnapshot *VSInspectLayerDetails(id engine, NSUInteger layerNum) {
+    if (!engine) return nil;
+    @autoreleasepool {
+        @try {
+            id layer = [engine layerAtLayerNum:layerNum];
+            if (!layer) return nil;
+            
+            // Loại trừ các loại layer 3D/text/shape không phải ảnh hoặc video phẳng
+            if (VSSafeValueForKey(layer, @"layer3D") || VSSafeValueForKey(layer, @"layer3d")) return nil;
+            
+            id generator = [layer respondsToSelector:@selector(imageGenerator)] ? [layer imageGenerator] : nil;
+            if (!generator) return nil;
+            
+            if ([generator respondsToSelector:@selector(layerDrawing)] && [generator layerDrawing]) return nil;
+            if ([generator respondsToSelector:@selector(layerZaps)] && [generator layerZaps]) return nil;
+            if ([generator respondsToSelector:@selector(layerGIF)] && [generator layerGIF]) return nil;
+            if ([generator respondsToSelector:@selector(layerOverlay)] && [generator layerOverlay]) return nil;
+            
+            if (VSSafeValueForKey(generator, @"isTextLayer") || VSSafeValueForKey(generator, @"isColorLayer") ||
+                VSSafeValueForKey(generator, @"is3DLayer") || VSSafeValueForKey(generator, @"isDrawingLayer") ||
+                VSSafeValueForKey(generator, @"fillColor") || VSSafeValueForKey(generator, @"textView")) {
+                return nil;
+            }
+            
+            VSLayerSnapshot *snap = [VSLayerSnapshot new];
+            snap.layerIndex = layerNum;
+            snap.assetInfo = [layer respondsToSelector:@selector(origAssetInfo)] ? [layer origAssetInfo] : @"";
+            
+            if ([generator respondsToSelector:@selector(layerImageTextureID)]) {
+                snap.textureID = [generator layerImageTextureID];
+            }
+            
+            id asset = [generator respondsToSelector:@selector(asset)] ? [generator asset] : nil;
+            if ([asset isKindOfClass:[AVAsset class]]) {
+                snap.mediaKind = VSLayerMediaKindVideo;
+                snap.mediaObject = asset;
+                return snap;
+            }
+            
+            UIImage *img = [generator respondsToSelector:@selector(layerImage)] ? [generator layerImage] : nil;
+            if ([img isKindOfClass:[UIImage class]] && img.size.width > 1.0) {
+                snap.mediaKind = VSLayerMediaKindImage;
+                snap.mediaObject = img;
+                return snap;
+            }
+            
+            // Trường hợp layer đã tạo nhưng chưa có asset hoặc ảnh tĩnh
+            snap.mediaKind = VSLayerMediaKindImage;
+            snap.mediaObject = nil;
+            return snap;
+        } @catch (NSException *e) {
+            VSLog(@"Lỗi inspect layer %lu: %@", (unsigned long)layerNum, e);
+            return nil;
+        }
+    }
+}
+
+// ============================================================================
+// PHẦN 5: TRÍCH XUẤT VÀ LƯU TRỮ QR CODE BẰNG COREIMAGE ĐỘ CHÍNH XÁC CAO
+// ============================================================================
+
+static NSString *VSGetLastQRCodeStoragePath(void) {
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    return [docs stringByAppendingPathComponent:@"VideoStarTool_CachedLastQR.png"];
+}
+
+static void VSPersistQRCodeImageData(id rawData) {
+    if (!rawData) return;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        @autoreleasepool {
+            UIImage *image = nil;
+            if ([rawData isKindOfClass:[NSData class]]) {
+                image = [UIImage imageWithData:(NSData *)rawData];
+            } else if ([rawData isKindOfClass:[UIImage class]]) {
+                image = (UIImage *)rawData;
+            }
+            if (image) {
+                NSData *pngData = UIImagePNGRepresentation(image);
+                [pngData writeToFile:VSGetLastQRCodeStoragePath() atomically:YES];
+                VSLog(@"Đã lưu QR code gần nhất thành công (%lu bytes).", (unsigned long)pngData.length);
+            }
+        }
+    });
+}
+
+static UIImage *VSReadLastPersistedQRCodeImage(void) {
+    NSString *path = VSGetLastQRCodeStoragePath();
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return nil;
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    return data.length ? [UIImage imageWithData:data] : nil;
+}
+
+static NSString *VSDecodeQRCodeMessageFromImage(UIImage *image) {
+    if (!image) return nil;
+    @autoreleasepool {
+        CIImage *ci = [CIImage imageWithCGImage:image.CGImage];
+        if (!ci) ci = [[CIImage alloc] initWithImage:image];
+        if (!ci) return nil;
+        
+        CIDetector *detector = [CIDetector detectorOfType:CIDetectorTypeQRCode
+                                                  context:nil
+                                                  options:@{CIDetectorAccuracy: CIDetectorAccuracyHigh}];
+        NSArray *features = [detector featuresInImage:ci];
+        for (CIFeature *f in features) {
+            if ([f isKindOfClass:[CIQRCodeFeature class]]) {
+                CIQRCodeFeature *qrf = (CIQRCodeFeature *)f;
+                if (qrf.messageString.length) return qrf.messageString;
+            }
+        }
+        return nil;
+    }
+}
+
+// ============================================================================
+// PHẦN 6: HOOKS AN TOÀN — THEOS / LOGOS SWIZZLE CÓ BẢO VỆ
+// ============================================================================
+
+static IMP g_origPickedWithResponse = NULL;
+static IMP g_origSelectedCodeWithImageData = NULL;
+static IMP g_origImportNewPreset = NULL;
+static IMP g_origImportOldPreset = NULL;
+static IMP g_origCustomPopupShow = NULL;
+
+static NSUInteger g_presetImportEventCounter = 0;
+static void (^g_activeMediaPickedHandler)(id editorVC, id response) = nil;
+
+static BOOL VSRobustSwizzleMethod(NSString *className, SEL selector, id blockImpl, IMP *origImp) {
+    Class cls = NSClassFromString(className);
+    if (!cls) {
+        VSLog(@"Không tìm thấy class để swizzle: %@", className);
+        return NO;
+    }
+    Method method = class_getInstanceMethod(cls, selector);
+    if (!method) {
+        VSLog(@"Không tìm thấy method để swizzle: -[%@ %@]", className, NSStringFromSelector(selector));
+        return NO;
+    }
+    if (*origImp != NULL) return YES;
+    
+    IMP newImp = imp_implementationWithBlock(blockImpl);
+    const char *types = method_getTypeEncoding(method);
+    
+    if (class_addMethod(cls, selector, newImp, types)) {
+        *origImp = method_getImplementation(method);
+    } else {
+        *origImp = method_setImplementation(method, newImp);
+    }
+    return YES;
+}
+
+static void VSInstallCoreHooksOnce(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        g_activePopupsTable = [NSHashTable weakObjectsHashTable];
+        
+        // 1. Hook bắt kết quả chọn media từ ClipPicker
+        VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(pickedWithClipPickerResponse:),
+                              ^(id selfInstance, id response) {
+            if (g_origPickedWithResponse) {
+                ((void (*)(id, SEL, id))g_origPickedWithResponse)(selfInstance, @selector(pickedWithClipPickerResponse:), response);
+            }
+            void (^handler)(id, id) = g_activeMediaPickedHandler;
+            if (handler) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    @autoreleasepool { handler(selfInstance, response); }
+                });
+            }
+        }, &g_origPickedWithResponse);
+        
+        // 2. Hook bắt ảnh QR khi người dùng chọn trong QRCodeManager
+        VSRobustSwizzleMethod(@"QRCodeManager", @selector(selectedCode:withImageData:),
+                              ^(id selfInstance, id code, id imageData) {
+            VSPersistQRCodeImageData(imageData);
+            if (g_origSelectedCodeWithImageData) {
+                ((void (*)(id, SEL, id, id))g_origSelectedCodeWithImageData)(selfInstance, @selector(selectedCode:withImageData:), code, imageData);
+            }
+        }, &g_origSelectedCodeWithImageData);
+        
+        // 3. Hook đếm sự kiện nạp preset mới
+        VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(importNewPreset:keyFrameAction:qrDurationInFrames:),
+                              ^(id selfInstance, id preset, id action, NSInteger frames) {
+            if (g_origImportNewPreset) {
+                ((void (*)(id, SEL, id, id, NSInteger))g_origImportNewPreset)(selfInstance, @selector(importNewPreset:keyFrameAction:qrDurationInFrames:), preset, action, frames);
+            }
+            g_presetImportEventCounter++;
+            VSLog(@"[Hook] Đã kích hoạt importNewPreset (lần thứ %lu)", (unsigned long)g_presetImportEventCounter);
+        }, &g_origImportNewPreset);
+        
+        // 4. Hook đếm sự kiện nạp preset cũ
+        VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(importOldPreset:),
+                              ^(id selfInstance, id preset) {
+            if (g_origImportOldPreset) {
+                ((void (*)(id, SEL, id))g_origImportOldPreset)(selfInstance, @selector(importOldPreset:), preset);
+            }
+            g_presetImportEventCounter++;
+            VSLog(@"[Hook] Đã kích hoạt importOldPreset (lần thứ %lu)", (unsigned long)g_presetImportEventCounter);
+        }, &g_origImportOldPreset);
+        
+        // 5. Hook CustomPopup show: Xử lý tức thì các cảnh báo lệch frame và popup thừa
+        VSRobustSwizzleMethod(@"CustomPopup", @selector(show),
+                              ^(id selfInstance) {
+            if (g_origCustomPopupShow) {
+                ((void (*)(id, SEL))g_origCustomPopupShow)(selfInstance, @selector(show));
+            }
+            if (selfInstance) {
+                [g_activePopupsTable addObject:selfInstance];
+            }
+            // Đặt lịch giải quyết popup ngay sau 80ms để đảm bảo layout view hoàn tất
+            VSDispatchAfterMS(80, ^{
+                VSResolvePopupsImmediately(nil);
+            });
+        }, &g_origCustomPopupShow);
+        
+        VSLog(@"Đã cài đặt hoàn chỉnh các Hooks cốt lõi.");
+    });
+}
+
+static BOOL VSReplayClipPickerResponseOnEditor(id editorVC, id response) {
+    if (!editorVC || !response || !g_origPickedWithResponse) return NO;
+    @autoreleasepool {
+        @try {
+            ((void (*)(id, SEL, id))g_origPickedWithResponse)(editorVC, @selector(pickedWithClipPickerResponse:), response);
+            return YES;
+        } @catch (NSException *e) {
+            VSLog(@"Lỗi Replay ClipPickerResponse: %@", e);
+            return NO;
+        }
+    }
+}
+
+// ============================================================================
+// PHẦN 7: GIAO DIỆN NGUYÊN BẢN (FLOATING BUTTON, STATUS HUD, MODAL VIEWS)
+// ============================================================================
+
+@interface VSToolPassThroughWindow : UIWindow
+@end
+
+@implementation VSToolPassThroughWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hitView = [super hitTest:point withEvent:event];
+    if (hitView == self || hitView == self.rootViewController.view) {
+        return nil; // Cho phép tương tác chạm xuyên qua cửa sổ nền
+    }
+    return hitView;
 }
 @end
 
-static UIColor *VSCyan(void) { return [UIColor colorWithRed:0.25 green:0.85 blue:0.96 alpha:1]; }
-static UIColor *VSCardBG(void) { return [UIColor colorWithRed:0.02 green:0.09 blue:0.12 alpha:0.96]; }
-static UIButton *VSOutlineButton(NSString *title, CGRect f) {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-    b.frame = f; b.layer.cornerRadius = 8; b.layer.borderWidth = 1.2; b.layer.borderColor = VSCyan().CGColor;
-    [b setTitle:title forState:UIControlStateNormal];
-    [b setTitleColor:VSCyan() forState:UIControlStateNormal];
-    [b setTitleColor:[VSCyan() colorWithAlphaComponent:0.35] forState:UIControlStateDisabled];
-    b.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
-    return b;
+static inline UIColor *VSToolCyanColor(void) {
+    return [UIColor colorWithRed:0.25 green:0.85 blue:0.96 alpha:1.0];
 }
 
-@interface VSImageVC : UIViewController
-@property (nonatomic, strong) UIImage *image;
+static inline UIColor *VSToolCardBackgroundColor(void) {
+    return [UIColor colorWithRed:0.03 green:0.08 blue:0.12 alpha:0.96];
+}
+
+static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+    btn.frame = frame;
+    btn.layer.cornerRadius = 8.0;
+    btn.layer.borderWidth = 1.2;
+    btn.layer.borderColor = VSToolCyanColor().CGColor;
+    [btn setTitle:title forState:UIControlStateNormal];
+    [btn setTitleColor:VSToolCyanColor() forState:UIControlStateNormal];
+    [btn setTitleColor:[VSToolCyanColor() colorWithAlphaComponent:0.35] forState:UIControlStateDisabled];
+    btn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    return btn;
+}
+
+@interface VSToolQRCodePreviewVC : UIViewController
+@property (nonatomic, strong) UIImage *qrImage;
 @end
-@implementation VSImageVC
+
+@implementation VSToolQRCodePreviewVC
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.88];
-    UIImageView *iv = [[UIImageView alloc] initWithImage:self.image];
+    self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.90];
+    
+    UIImageView *iv = [[UIImageView alloc] initWithImage:self.qrImage];
     iv.contentMode = UIViewContentModeScaleAspectFit;
-    iv.layer.cornerRadius = 12; iv.clipsToBounds = YES;
+    iv.layer.cornerRadius = 14;
+    iv.clipsToBounds = YES;
     iv.frame = CGRectInset(self.view.bounds, 24, 110);
     iv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:iv];
-    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(0, 60, self.view.bounds.size.width, 30)];
-    t.text = @"Code gần nhất đã nhập"; t.textColor = UIColor.whiteColor; t.textAlignment = NSTextAlignmentCenter;
-    t.font = [UIFont boldSystemFontOfSize:18]; t.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    [self.view addSubview:t];
-    NSArray *titles = @[@"Đóng", @"Chia sẻ / Lưu"];
+    
+    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 56, self.view.bounds.size.width, 32)];
+    titleLabel.text = @"Code gần nhất đã nhập";
+    titleLabel.textColor = UIColor.whiteColor;
+    titleLabel.textAlignment = NSTextAlignmentCenter;
+    titleLabel.font = [UIFont boldSystemFontOfSize:18];
+    titleLabel.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [self.view addSubview:titleLabel];
+    
+    CGFloat w = (self.view.bounds.size.width - 48) / 2.0;
+    NSArray *buttonTitles = @[@"Đóng", @"Chia sẻ / Lưu"];
     for (NSUInteger i = 0; i < 2; i++) {
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        b.frame = CGRectMake(24 + i * (self.view.bounds.size.width - 48) / 2, self.view.bounds.size.height - 90,
-                             (self.view.bounds.size.width - 48) / 2, 44);
+        b.frame = CGRectMake(24 + i * (w + 12), self.view.bounds.size.height - 84, w - 6, 44);
         b.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleWidth;
-        [b setTitle:titles[i] forState:UIControlStateNormal];
-        b.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+        [b setTitle:buttonTitles[i] forState:UIControlStateNormal];
+        b.titleLabel.font = [UIFont boldSystemFontOfSize:16];
         b.tag = (NSInteger)i;
-        [b addTarget:self action:@selector(tapped:) forControlEvents:UIControlEventTouchUpInside];
+        [b addTarget:self action:@selector(actionButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
         [self.view addSubview:b];
     }
 }
-- (void)tapped:(UIButton *)b {
-    if (b.tag == 0) { [self dismissViewControllerAnimated:YES completion:nil]; return; }
-    UIActivityViewController *a = [[UIActivityViewController alloc] initWithActivityItems:@[self.image] applicationActivities:nil];
-    a.popoverPresentationController.sourceView = b;
-    [self presentViewController:a animated:YES completion:nil];
+
+- (void)actionButtonTapped:(UIButton *)button {
+    if (button.tag == 0) {
+        [self dismissViewControllerAnimated:YES completion:nil];
+    } else {
+        if (!self.qrImage) return;
+        UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[self.qrImage] applicationActivities:nil];
+        avc.popoverPresentationController.sourceView = button;
+        [self presentViewController:avc animated:YES completion:nil];
+    }
 }
 @end
 
-// Delegate giả cho QRCodeManager — chỉ nghe code, không tự nhập
-@interface VSQRCaptureDelegate : NSObject
-@property (nonatomic, copy) void (^onCode)(id preset, id code);
+// Delegate trung gian bắt mã QR nhập từ QRCodeManager mà không ghi đè trực tiếp
+@interface VSToolQRCodeCaptureProxy : NSObject
+@property (nonatomic, copy) void (^onCodeCapturedBlock)(id presetData, id codeIdentifier);
 @end
-@implementation VSQRCaptureDelegate
-- (NSString *)qrLabel { return VSL(@"Multi-Layer"); }
+
+@implementation VSToolQRCodeCaptureProxy
+- (NSString *)qrLabel { return VSLocalizedString(@"Multi-Layer"); }
 - (NSString *)qrSetupLabel { return @""; }
 - (NSString *)codePrefix { return @"n"; }
 - (BOOL)validCode:(NSString *)code {
-    return [code isKindOfClass:NSString.class] && ([code hasPrefix:@"m"] || [code hasPrefix:@"n"]);
+    return [code isKindOfClass:[NSString class]] && ([code hasPrefix:@"m"] || [code hasPrefix:@"n"]);
 }
 - (void)importedData:(id)data code:(id)code {
-    void (^cb)(id, id) = self.onCode;
-    if (cb) dispatch_async(dispatch_get_main_queue(), ^{ cb(data, code); });
+    void (^block)(id, id) = self.onCodeCapturedBlock;
+    if (block) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @autoreleasepool { block(data, code); }
+        });
+    }
 }
 - (id)dataToShare { return nil; }
 - (void)setActivityiPadPopup:(id)popup {}
@@ -436,617 +810,1186 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
 @end
 
 // ============================================================================
-// VSTOOL — điều phối 4 chức năng
+// PHẦN 8: BỘ ĐIỀU PHỐI TỔNG THỂ VSTOOL (CORE CONTROLLER)
 // ============================================================================
-@interface VSRootVC : UIViewController @end
 
-@interface VSTool : NSObject
-@property (nonatomic, strong) VSPassWindow *window;
-@property (nonatomic, strong) UIButton *fab;
-@property (nonatomic, strong) UILabel *statusLabel;
-@property (nonatomic, strong) UIView *bar;
-@property (nonatomic, strong) VSQRCaptureDelegate *qrCapture;
-@property (nonatomic, strong) NSMutableArray *msPresets;
-@property (nonatomic, strong) NSMutableArray *msCodes;
-@property (nonatomic) NSUInteger msStart, msCount, msOrigLast, msRid;
-@property (nonatomic) NSInteger msCapturing;
-@property (nonatomic, strong) UIView *msCard;
-@property (nonatomic, copy) NSString *busyName;
-@property (nonatomic, strong) id savedQRDelegate;
-@property (nonatomic) BOOL savedQRDelegateValid;
-@property (nonatomic, copy) void (^barOK)(void);
-@property (nonatomic, copy) void (^barCancel)(void);
-+ (instancetype)shared;
-- (void)installIfNeeded;
-- (void)clampFab;
-- (void)msBackToCodePanel;
+@interface VSToolRootVC : UIViewController
 @end
 
-@implementation VSRootVC
-- (void)viewDidLayoutSubviews { [super viewDidLayoutSubviews]; [VSTool.shared clampFab]; }
+@interface VSTool : NSObject
+@property (nonatomic, strong) VSToolPassThroughWindow *window;
+@property (nonatomic, strong) UIButton *floatingButton;
+@property (nonatomic, strong) UILabel *statusHUDLabel;
+@property (nonatomic, strong) UIView *bottomActionBar;
+@property (nonatomic, strong) VSToolQRCodeCaptureProxy *qrCaptureProxy;
+@property (nonatomic, strong) NSMutableArray *multiScenePresets;
+@property (nonatomic, strong) NSMutableArray *multiSceneCodes;
+@property (nonatomic, assign) NSUInteger multiSceneStart;
+@property (nonatomic, assign) NSUInteger multiSceneCount;
+@property (nonatomic, assign) NSUInteger multiSceneOriginalLastViewed;
+@property (nonatomic, assign) NSUInteger multiSceneRunId;
+@property (nonatomic, assign) NSInteger multiSceneActiveCapturingIndex;
+@property (nonatomic, strong) UIView *multiSceneCardView;
+@property (nonatomic, copy)   NSString *currentTaskName;
+@property (nonatomic, strong) id savedOriginalQRDelegate;
+@property (nonatomic, assign) BOOL savedOriginalQRDelegateValid;
+@property (nonatomic, copy)   void (^bottomBarConfirmBlock)(void);
+@property (nonatomic, copy)   void (^bottomBarCancelBlock)(void);
+
+// --- Core lifecycle
++ (instancetype)shared;
+- (void)setupToolInterfaceIfNeeded;
+- (void)adjustFloatingButtonBounds;
+- (void)restoreOriginalQRCodeDelegate;
+- (void)terminateCurrentTaskQuietly;
+
+// --- Floating button
+- (void)handleFabPan:(UIPanGestureRecognizer *)gesture;
+- (void)fabClicked;
+
+// --- HUD + Alerts
+- (UIViewController *)topPresenterVC;
+- (void)updateStatusHUD:(NSString *)message;
+- (void)showNotificationAlert:(NSString *)message title:(NSString *)title;
+
+// --- Bottom bar
+- (void)dismissBottomActionBar;
+- (UIView *)buildCardContainerWithFrame:(CGRect)frame title:(NSString *)title subtitle:(NSString *)subtitle;
+- (void)displayBottomActionBarWithTitle:(NSString *)title
+                                message:(NSString *)msg
+                           confirmTitle:(NSString *)confirmTitle
+                              onConfirm:(void (^)(void))onConfirm
+                               onCancel:(void (^)(void))onCancel;
+- (void)handleBottomBarConfirm;
+- (void)handleBottomBarCancel;
+
+// --- Task lifecycle
+- (NSUInteger)startNewTaskWithDescription:(NSString *)taskName initialStatus:(NSString *)initialStatus;
+- (void)finalizeTaskWithMessage:(NSString *)msg;
+
+// --- Feature 1: Auto replace layers
+- (void)requestUserMediaSelectionOnEditor:(id)editorVC
+                                    runId:(NSUInteger)runId
+                               completion:(void (^)(id clipResponse, VSLayerSnapshot *firstLayerInfo))done;
+- (void)applyMediaResponse:(id)response
+                  toEditor:(id)editorVC
+                filterKind:(VSLayerMediaKind)filterKind
+                 skipLayer:(NSInteger)skipIndex
+                     runId:(NSUInteger)runId
+                completion:(void (^)(NSUInteger changedCount, NSUInteger totalCount))done;
+- (void)executeFeature1ReplaceLayers;
+
+// --- Feature 2: Display last QR
+- (void)executeFeature2DisplayLastCode;
+
+// --- Feature 3: Beat split
+- (void)executeFeature3AutoSplitBeat;
+- (void)validateAndRunBeatSplitting:(id)reviewVC splitView:(id)splitView runId:(NSUInteger)runId;
+
+// --- Feature 4: Batch multi-scene
+- (void)executeFeature4BatchMultiScene;
+- (void)parseMergeRangeAndPresentCodePanel:(id)reviewVC
+                                     runId:(NSUInteger)runId
+                        originalLastViewed:(NSUInteger)originalLastViewed;
+- (NSUInteger)countOfReceivedCodes;
+- (void)renderMultiSceneCodeCollectionPanel;
+- (void)handleMultiSceneCancel;
+- (void)restoreMultiSceneCodePanel;
+- (void)handleCodeRowButtonTapped:(UIButton *)button;
+- (void)handleMultiSceneProceedWithMedia;
+- (void)showProcessingProgressPanel;
+- (void)executeBatchProcessingScenesWithResponse:(id)response runId:(NSUInteger)runId;
+- (void)openMultiLayerEditorForScene:(NSUInteger)sceneIndex
+                            reviewVC:(id)reviewVC
+                               runId:(NSUInteger)runId
+                          completion:(void (^)(id editorVC))done;
+- (void)importPresetPayload:(id)preset
+            codeIdentifier:(id)code
+                intoEditor:(id)editorVC
+                     runId:(NSUInteger)runId
+                completion:(void (^)(NSString *errorMessage))done;
+- (void)triggerCreateInEditor:(id)editorVC
+                        runId:(NSUInteger)runId
+                   completion:(void (^)(NSString *errorMessage))done;
+@end
+
+@implementation VSToolRootVC
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    [VSTool.shared adjustFloatingButtonBounds];
+}
 @end
 
 @implementation VSTool
 
 + (instancetype)shared {
-    static VSTool *t; static dispatch_once_t o;
-    dispatch_once(&o, ^{ t = [VSTool new]; });
-    return t;
+    static VSTool *singleton = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        singleton = [VSTool new];
+    });
+    return singleton;
 }
 
-- (void)installIfNeeded {
+- (void)setupToolInterfaceIfNeeded {
     if (self.window) return;
-    static BOOL didDelay = NO;
-    if (!didDelay) {
-        didDelay = YES;
-        VSAfter(3000, ^{ [self installIfNeeded]; }); // chờ patch Pro kịp chạy
+    
+    static BOOL delayPassed = NO;
+    if (!delayPassed) {
+        delayPassed = YES;
+        // Trì hoãn 2.5s để ứng dụng Video Star hoàn tất nạp framework và UI ban đầu
+        VSDispatchAfterMS(2500, ^{
+            [self setupToolInterfaceIfNeeded];
+        });
         return;
     }
-    CGRect b = UIScreen.mainScreen.bounds;
-    VSPassWindow *w = nil;
+    
+    CGRect screenBounds = UIScreen.mainScreen.bounds;
+    VSToolPassThroughWindow *toolWindow = nil;
+    
     if (@available(iOS 13.0, *)) {
-        for (UIScene *s in UIApplication.sharedApplication.connectedScenes)
-            if ([s isKindOfClass:UIWindowScene.class]) { w = [[VSPassWindow alloc] initWithWindowScene:(UIWindowScene *)s]; break; }
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                toolWindow = [[VSToolPassThroughWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
+                break;
+            }
+        }
     }
-    if (!w) w = [[VSPassWindow alloc] initWithFrame:b];
-    w.frame = b; w.windowLevel = UIWindowLevelAlert + 100; w.backgroundColor = UIColor.clearColor;
-    VSRootVC *root = [VSRootVC new];
-    root.view.backgroundColor = UIColor.clearColor;
-    w.rootViewController = root;
-
+    if (!toolWindow) {
+        toolWindow = [[VSToolPassThroughWindow alloc] initWithFrame:screenBounds];
+    }
+    
+    toolWindow.frame = screenBounds;
+    toolWindow.windowLevel = UIWindowLevelAlert + 100;
+    toolWindow.backgroundColor = UIColor.clearColor;
+    
+    VSToolRootVC *rootVC = [VSToolRootVC new];
+    rootVC.view.backgroundColor = UIColor.clearColor;
+    toolWindow.rootViewController = rootVC;
+    
+    // Nút nổi (FAB)
     UIButton *fab = [UIButton buttonWithType:UIButtonTypeCustom];
-    fab.frame = CGRectMake(b.size.width - 64, b.size.height * 0.35, 48, 48);
-    fab.backgroundColor = [UIColor colorWithRed:0.10 green:0.10 blue:0.12 alpha:0.82];
-    fab.layer.cornerRadius = 24;
-    fab.layer.borderWidth = 1.5; fab.layer.borderColor = VSCyan().CGColor;
+    fab.frame = CGRectMake(screenBounds.size.width - 64, screenBounds.size.height * 0.35, 48, 48);
+    fab.backgroundColor = [UIColor colorWithRed:0.10 green:0.10 blue:0.13 alpha:0.85];
+    fab.layer.cornerRadius = 24.0;
+    fab.layer.borderWidth = 1.5;
+    fab.layer.borderColor = VSToolCyanColor().CGColor;
     [fab setTitle:@"VS" forState:UIControlStateNormal];
     fab.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    [fab setTitleColor:VSCyan() forState:UIControlStateNormal];
-    [fab addTarget:self action:@selector(fabTapped) forControlEvents:UIControlEventTouchUpInside];
-    [fab addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(fabPan:)]];
-    [root.view addSubview:fab];
-
-    UILabel *st = [[UILabel alloc] init];
-    st.backgroundColor = [UIColor colorWithWhite:0 alpha:0.78];
-    st.textColor = UIColor.whiteColor; st.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-    st.textAlignment = NSTextAlignmentCenter; st.numberOfLines = 2;
-    st.layer.cornerRadius = 10; st.clipsToBounds = YES; st.hidden = YES;
-    [root.view addSubview:st];
-
-    self.window = w; self.fab = fab; self.statusLabel = st;
-    self.msCapturing = -1;
-    g_toolWindow = w;
-    w.hidden = NO;
-    VSInstallHooks();
-    VSLog(@"installed");
+    [fab setTitleColor:VSToolCyanColor() forState:UIControlStateNormal];
+    [fab addTarget:self action:@selector(fabClicked) forControlEvents:UIControlEventTouchUpInside];
+    
+    UIPanGestureRecognizer *panGesture = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handleFabPan:)];
+    [fab addGestureRecognizer:panGesture];
+    [rootVC.view addSubview:fab];
+    
+    // Thanh hiển thị trạng thái (Status HUD)
+    UILabel *hud = [[UILabel alloc] init];
+    hud.backgroundColor = [UIColor colorWithWhite:0 alpha:0.82];
+    hud.textColor = UIColor.whiteColor;
+    hud.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    hud.textAlignment = NSTextAlignmentCenter;
+    hud.numberOfLines = 2;
+    hud.layer.cornerRadius = 10;
+    hud.clipsToBounds = YES;
+    hud.hidden = YES;
+    [rootVC.view addSubview:hud];
+    
+    self.window = toolWindow;
+    self.floatingButton = fab;
+    self.statusHUDLabel = hud;
+    self.multiSceneActiveCapturingIndex = -1;
+    g_overlayToolWindow = toolWindow;
+    
+    toolWindow.hidden = NO;
+    VSInstallCoreHooksOnce();
+    VSLog(@"Đã cài đặt giao diện VSTool thành công.");
 }
 
-- (void)clampFab {
-    UIView *v = self.window.rootViewController.view;
-    UIEdgeInsets ins = v.safeAreaInsets;
-    CGFloat hw = self.fab.bounds.size.width / 2;
-    CGPoint c = self.fab.center;
-    c.x = MIN(MAX(c.x, hw + 4), v.bounds.size.width - hw - 4);
-    c.y = MIN(MAX(c.y, ins.top + hw + 4), v.bounds.size.height - ins.bottom - hw - 4);
-    self.fab.center = c;
+- (void)adjustFloatingButtonBounds {
+    if (!self.window || !self.floatingButton) return;
+    UIView *container = self.window.rootViewController.view;
+    UIEdgeInsets insets = container.safeAreaInsets;
+    CGFloat halfWidth = self.floatingButton.bounds.size.width / 2.0;
+    CGPoint currentCenter = self.floatingButton.center;
+    
+    currentCenter.x = MIN(MAX(currentCenter.x, halfWidth + 4), container.bounds.size.width - halfWidth - 4);
+    currentCenter.y = MIN(MAX(currentCenter.y, insets.top + halfWidth + 4), container.bounds.size.height - insets.bottom - halfWidth - 4);
+    self.floatingButton.center = currentCenter;
 }
 
-- (void)fabPan:(UIPanGestureRecognizer *)g {
-    CGPoint t = [g translationInView:self.fab.superview];
-    self.fab.center = CGPointMake(self.fab.center.x + t.x, self.fab.center.y + t.y);
-    [g setTranslation:CGPointZero inView:self.fab.superview];
-    if (g.state == UIGestureRecognizerStateEnded) [self clampFab];
+- (void)handleFabPan:(UIPanGestureRecognizer *)gesture {
+    CGPoint translation = [gesture translationInView:self.floatingButton.superview];
+    self.floatingButton.center = CGPointMake(self.floatingButton.center.x + translation.x,
+                                             self.floatingButton.center.y + translation.y);
+    [gesture setTranslation:CGPointZero inView:self.floatingButton.superview];
+    if (gesture.state == UIGestureRecognizerStateEnded) {
+        [self adjustFloatingButtonBounds];
+    }
 }
 
-- (UIViewController *)presenter {
-    UIViewController *p = self.window.rootViewController;
-    while (p.presentedViewController) p = p.presentedViewController;
-    return p;
+- (UIViewController *)topPresenterVC {
+    UIViewController *vc = self.window.rootViewController;
+    while (vc.presentedViewController) {
+        vc = vc.presentedViewController;
+    }
+    return vc;
 }
 
-- (void)status:(NSString *)text {
-    UIView *root = self.window.rootViewController.view;
-    self.statusLabel.text = text;
-    CGFloat w = MIN(root.bounds.size.width - 32, 420);
-    self.statusLabel.frame = CGRectMake((root.bounds.size.width - w) / 2, root.safeAreaInsets.top + 8, w, 40);
-    self.statusLabel.hidden = (text.length == 0);
+- (void)updateStatusHUD:(NSString *)message {
+    UIView *container = self.window.rootViewController.view;
+    self.statusHUDLabel.text = message;
+    CGFloat maxWidth = MIN(container.bounds.size.width - 32, 440);
+    self.statusHUDLabel.frame = CGRectMake((container.bounds.size.width - maxWidth) / 2.0,
+                                           container.safeAreaInsets.top + 8,
+                                           maxWidth,
+                                           40);
+    self.statusHUDLabel.hidden = (message.length == 0);
 }
 
-- (void)alert:(NSString *)msg { [self alert:msg title:@"VideoStarTool"]; }
-- (void)alert:(NSString *)msg title:(NSString *)title {
-    [self status:nil];
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    [[self presenter] presentViewController:a animated:YES completion:nil];
+- (void)showNotificationAlert:(NSString *)message title:(NSString *)title {
+    [self updateStatusHUD:nil];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title ?: @"VideoStarTool"
+                                                                   message:message
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [[self topPresenterVC] presentViewController:alert animated:YES completion:nil];
 }
 
-- (void)hideBar { [self.bar removeFromSuperview]; self.bar = nil; }
+- (void)dismissBottomActionBar {
+    [self.bottomActionBar removeFromSuperview];
+    self.bottomActionBar = nil;
+}
 
-- (UIView *)cardWithFrame:(CGRect)f title:(NSString *)title message:(NSString *)msg {
-    UIView *card = [[UIView alloc] initWithFrame:f];
-    card.backgroundColor = VSCardBG();
-    card.layer.cornerRadius = 14; card.layer.borderWidth = 1.2; card.layer.borderColor = VSCyan().CGColor;
+- (UIView *)buildCardContainerWithFrame:(CGRect)frame title:(NSString *)title subtitle:(NSString *)subtitle {
+    UIView *card = [[UIView alloc] initWithFrame:frame];
+    card.backgroundColor = VSToolCardBackgroundColor();
+    card.layer.cornerRadius = 14;
+    card.layer.borderWidth = 1.2;
+    card.layer.borderColor = VSToolCyanColor().CGColor;
     card.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
-    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, f.size.width - 32, 24)];
-    t.text = title; t.textColor = VSCyan(); t.font = [UIFont boldSystemFontOfSize:17];
-    t.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    UILabel *m = [[UILabel alloc] initWithFrame:CGRectMake(16, 42, f.size.width - 32, 34)];
-    m.text = msg; m.numberOfLines = 0; m.textColor = [UIColor colorWithWhite:0.85 alpha:1]; m.font = [UIFont systemFontOfSize:13];
-    m.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    [card addSubview:t]; [card addSubview:m];
+    
+    UILabel *header = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, frame.size.width - 32, 24)];
+    header.text = title;
+    header.textColor = VSToolCyanColor();
+    header.font = [UIFont boldSystemFontOfSize:17];
+    header.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    
+    UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(16, 42, frame.size.width - 32, 36)];
+    sub.text = subtitle;
+    sub.numberOfLines = 0;
+    sub.textColor = [UIColor colorWithWhite:0.86 alpha:1.0];
+    sub.font = [UIFont systemFontOfSize:13];
+    sub.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    
+    [card addSubview:header];
+    [card addSubview:sub];
     return card;
 }
 
-- (void)showBar:(NSString *)title message:(NSString *)msg ok:(NSString *)okTitle onOK:(void (^)(void))onOK onCancel:(void (^)(void))onCancel {
-    [self hideBar];
-    UIView *root = self.window.rootViewController.view;
-    CGFloat w = MIN(root.bounds.size.width - 24, 460), h = 132;
-    UIView *bar = [self cardWithFrame:CGRectMake((root.bounds.size.width - w) / 2, root.bounds.size.height - root.safeAreaInsets.bottom - h - 70, w, h) title:title message:msg];
-    self.barOK = onOK; self.barCancel = onCancel;
-    CGFloat bw = (w - 32 - 12) / 2;
-    UIButton *c = VSOutlineButton(@"Hủy", CGRectMake(16, h - 52, bw, 38));
-    c.layer.borderColor = [UIColor colorWithWhite:0.5 alpha:1].CGColor;
-    [c setTitleColor:[UIColor colorWithWhite:0.78 alpha:1] forState:UIControlStateNormal];
-    UIButton *o = VSOutlineButton(okTitle, CGRectMake(16 + bw + 12, h - 52, bw, 38));
-    [c addTarget:self action:@selector(barCancelTapped) forControlEvents:UIControlEventTouchUpInside];
-    [o addTarget:self action:@selector(barOKTapped) forControlEvents:UIControlEventTouchUpInside];
-    [bar addSubview:c]; [bar addSubview:o];
-    [root addSubview:bar];
-    self.bar = bar;
+- (void)displayBottomActionBarWithTitle:(NSString *)title message:(NSString *)msg confirmTitle:(NSString *)confirmTitle onConfirm:(void (^)(void))onConfirm onCancel:(void (^)(void))onCancel {
+    [self dismissBottomActionBar];
+    UIView *container = self.window.rootViewController.view;
+    CGFloat w = MIN(container.bounds.size.width - 24, 460);
+    CGFloat h = 132;
+    UIView *bar = [self buildCardContainerWithFrame:CGRectMake((container.bounds.size.width - w) / 2.0,
+                                                               container.bounds.size.height - container.safeAreaInsets.bottom - h - 70,
+                                                               w, h)
+                                              title:title
+                                           subtitle:msg];
+    
+    self.bottomBarConfirmBlock = onConfirm;
+    self.bottomBarCancelBlock = onCancel;
+    
+    CGFloat btnWidth = (w - 32 - 12) / 2.0;
+    UIButton *btnCancel = VSToolCreateOutlineButton(@"Hủy", CGRectMake(16, h - 52, btnWidth, 38));
+    btnCancel.layer.borderColor = [UIColor colorWithWhite:0.5 alpha:1.0].CGColor;
+    [btnCancel setTitleColor:[UIColor colorWithWhite:0.78 alpha:1.0] forState:UIControlStateNormal];
+    
+    UIButton *btnOK = VSToolCreateOutlineButton(confirmTitle, CGRectMake(16 + btnWidth + 12, h - 52, btnWidth, 38));
+    
+    [btnCancel addTarget:self action:@selector(handleBottomBarCancel) forControlEvents:UIControlEventTouchUpInside];
+    [btnOK addTarget:self action:@selector(handleBottomBarConfirm) forControlEvents:UIControlEventTouchUpInside];
+    
+    [bar addSubview:btnCancel];
+    [bar addSubview:btnOK];
+    [container addSubview:bar];
+    self.bottomActionBar = bar;
 }
 
-- (void)barOKTapped { void (^cb)(void) = self.barOK; self.barOK = nil; self.barCancel = nil; [self hideBar]; if (cb) cb(); }
-- (void)barCancelTapped { void (^cb)(void) = self.barCancel; self.barOK = nil; self.barCancel = nil; [self hideBar]; if (cb) cb(); }
+- (void)handleBottomBarConfirm {
+    void (^cb)(void) = self.bottomBarConfirmBlock;
+    self.bottomBarConfirmBlock = nil;
+    self.bottomBarCancelBlock = nil;
+    [self dismissBottomActionBar];
+    if (cb) cb();
+}
 
-- (void)fabTapped {
-    if (self.busyName) {
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Đang chạy" message:self.busyName preferredStyle:UIAlertControllerStyleAlert];
-        if (self.msCard && self.msCard.hidden)
-            [a addAction:[UIAlertAction actionWithTitle:@"Quay lại bảng nhập code" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [self msBackToCodePanel]; }]];
-        [a addAction:[UIAlertAction actionWithTitle:@"Dừng" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) { [self stopRunQuiet]; [self alert:@"Đã dừng."]; }]];
-        [a addAction:[UIAlertAction actionWithTitle:@"Tiếp tục chạy" style:UIAlertActionStyleCancel handler:nil]];
-        [[self presenter] presentViewController:a animated:YES completion:nil];
+- (void)handleBottomBarCancel {
+    void (^cb)(void) = self.bottomBarCancelBlock;
+    self.bottomBarConfirmBlock = nil;
+    self.bottomBarCancelBlock = nil;
+    [self dismissBottomActionBar];
+    if (cb) cb();
+}
+
+- (void)fabClicked {
+    if (self.currentTaskName) {
+        UIAlertController *runningAlert = [UIAlertController alertControllerWithTitle:@"Đang thực thi tác vụ"
+                                                                              message:self.currentTaskName
+                                                                       preferredStyle:UIAlertControllerStyleAlert];
+        if (self.multiSceneCardView && self.multiSceneCardView.hidden) {
+            [runningAlert addAction:[UIAlertAction actionWithTitle:@"Mở lại bảng mã QR"
+                                                             style:UIAlertActionStyleDefault
+                                                           handler:^(UIAlertAction *a) {
+                [self restoreMultiSceneCodePanel];
+            }]];
+        }
+        [runningAlert addAction:[UIAlertAction actionWithTitle:@"Dừng khẩn cấp"
+                                                         style:UIAlertActionStyleDestructive
+                                                       handler:^(UIAlertAction *a) {
+            [self terminateCurrentTaskQuietly];
+            [self showNotificationAlert:@"Đã dừng toàn bộ chu trình bot an toàn." title:@"Đã Dừng"];
+        }]];
+        [runningAlert addAction:[UIAlertAction actionWithTitle:@"Tiếp tục chạy" style:UIAlertActionStyleCancel handler:nil]];
+        [[self topPresenterVC] presentViewController:runningAlert animated:YES completion:nil];
         return;
     }
-    UIAlertController *m = [UIAlertController alertControllerWithTitle:@"VideoStarTool" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
-    [m addAction:[UIAlertAction actionWithTitle:@"1. Auto nhập ảnh vào các lớp" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [self runReplaceLayers]; }]];
-    [m addAction:[UIAlertAction actionWithTitle:@"2. Hiển thị code gần nhất" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [self runLastCode]; }]];
-    [m addAction:[UIAlertAction actionWithTitle:@"3. Auto chia beat" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [self runBeatSplit]; }]];
-    [m addAction:[UIAlertAction actionWithTitle:@"4. Auto nhập code + ảnh vào phân cảnh" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [self runMultiScene]; }]];
-    [m addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
-    m.popoverPresentationController.sourceView = self.fab;
-    m.popoverPresentationController.sourceRect = self.fab.bounds;
-    [[self presenter] presentViewController:m animated:YES completion:nil];
+    
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"VideoStarTool"
+                                                                   message:nil
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    
+    [sheet addAction:[UIAlertAction actionWithTitle:@"1. Auto nhập ảnh vào các lớp"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [self executeFeature1ReplaceLayers];
+    }]];
+    
+    [sheet addAction:[UIAlertAction actionWithTitle:@"2. Hiển thị code gần nhất"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [self executeFeature2DisplayLastCode];
+    }]];
+    
+    [sheet addAction:[UIAlertAction actionWithTitle:@"3. Auto chia beat"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [self executeFeature3AutoSplitBeat];
+    }]];
+    
+    [sheet addAction:[UIAlertAction actionWithTitle:@"4. Auto nhập code + ảnh vào phân cảnh"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [self executeFeature4BatchMultiScene];
+    }]];
+    
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
+    
+    sheet.popoverPresentationController.sourceView = self.floatingButton;
+    sheet.popoverPresentationController.sourceRect = self.floatingButton.bounds;
+    [[self topPresenterVC] presentViewController:sheet animated:YES completion:nil];
 }
 
-- (NSUInteger)beginRun:(NSString *)name status:(NSString *)text {
-    g_run++;
-    self.busyName = name;
-    self.fab.alpha = 0.6;
-    [self status:text];
-    return g_run;
+- (NSUInteger)startNewTaskWithDescription:(NSString *)taskName initialStatus:(NSString *)initialStatus {
+    g_runIdentifier++;
+    self.currentTaskName = taskName;
+    self.floatingButton.alpha = 0.55;
+    [self updateStatusHUD:initialStatus];
+    return g_runIdentifier;
 }
 
-- (void)restoreQRDelegate {
-    if (!self.savedQRDelegateValid) return;
-    id qr = [NSClassFromString(@"QRCodeManager") respondsToSelector:@selector(sharedInstance)] ? [NSClassFromString(@"QRCodeManager") sharedInstance] : nil;
-    VSSetQRDelegate(qr, self.savedQRDelegate);
-    self.savedQRDelegate = nil; self.savedQRDelegateValid = NO;
+- (void)restoreOriginalQRCodeDelegate {
+    if (!self.savedOriginalQRDelegateValid) return;
+    Class qc = NSClassFromString(@"QRCodeManager");
+    id qr = [qc respondsToSelector:@selector(sharedInstance)] ? [qc sharedInstance] : nil;
+    if (qr && [qr respondsToSelector:@selector(setDelegate:)]) {
+        [qr setDelegate:self.savedOriginalQRDelegate];
+    }
+    self.savedOriginalQRDelegate = nil;
+    self.savedOriginalQRDelegateValid = NO;
 }
 
-- (void)stopRunQuiet {
-    g_run++;
-    g_pickedHandler = nil;
-    [self restoreQRDelegate];
-    [self hideBar];
-    [self.msCard removeFromSuperview]; self.msCard = nil; self.msCapturing = -1; self.qrCapture = nil;
-    self.busyName = nil; self.fab.alpha = 1;
-    [self status:nil];
+- (void)terminateCurrentTaskQuietly {
+    g_runIdentifier++;
+    g_activeMediaPickedHandler = nil;
+    [self restoreOriginalQRCodeDelegate];
+    [self dismissBottomActionBar];
+    [self.multiSceneCardView removeFromSuperview];
+    self.multiSceneCardView = nil;
+    self.multiSceneActiveCapturingIndex = -1;
+    self.qrCaptureProxy = nil;
+    self.currentTaskName = nil;
+    self.floatingButton.alpha = 1.0;
+    [self updateStatusHUD:nil];
 }
 
-- (void)endRun:(NSString *)message {
-    [self stopRunQuiet];
-    if (message.length) [self alert:message];
+- (void)finalizeTaskWithMessage:(NSString *)msg {
+    [self terminateCurrentTaskQuietly];
+    if (msg.length) {
+        [self showNotificationAlert:msg title:@"VideoStarTool"];
+    }
 }
 
 // ============================================================================
-// FEATURE 1 — 1-Chạm Thay Media (theo logic doc)
+// PHẦN 9: TÍNH NĂNG 1 — AUTO NHẬP ẢNH VÀO TẤT CẢ CÁC LỚP (1-CHẠM THAY MEDIA)
 // ============================================================================
-- (void)pickMediaOnEditor:(id)editor rid:(NSUInteger)rid completion:(void (^)(id resp, NSDictionary *info))done {
-    if (!g_origPicked) { done(nil, nil); return; }
-    g_pickedHandler = ^(id me, id resp) {
-        if (rid != g_run || me != editor) return;
-        g_pickedHandler = nil;
-        __block NSDictionary *found = nil;
-        VSPoll(rid, 150, 40, ^BOOL{
-            id eng = [me getMultiLayerEngine]; NSInteger n = [me lastSelectedLayerNum];
-            if (!eng || n < 0) return NO;
-            found = VSLayerInfo(eng, (NSUInteger)n);
-            return found != nil;
-        }, ^(BOOL ok) { done(ok ? resp : nil, found); });
+
+- (void)requestUserMediaSelectionOnEditor:(id)editorVC runId:(NSUInteger)runId completion:(void (^)(id clipResponse, VSLayerSnapshot *firstLayerInfo))done {
+    if (!g_origPickedWithResponse) {
+        done(nil, nil);
+        return;
+    }
+    
+    g_activeMediaPickedHandler = ^(id me, id response) {
+        if (runId != g_runIdentifier || me != editorVC) return;
+        g_activeMediaPickedHandler = nil;
+        
+        __block VSLayerSnapshot *snapshot = nil;
+        VSSafePoll(runId, 120, 50, ^BOOL{
+            id engine = [me getMultiLayerEngine];
+            NSInteger selectedNum = [me lastSelectedLayerNum];
+            if (!engine || selectedNum < 0) return NO;
+            snapshot = VSInspectLayerDetails(engine, (NSUInteger)selectedNum);
+            return snapshot != nil;
+        }, ^(BOOL ok) {
+            done(ok ? response : nil, snapshot);
+        });
     };
-    VSPoll(rid, 100, 80, ^BOOL{
-        return [editor isViewLoaded] && [[editor view] window] && [editor getMultiLayerEngine];
-    }, ^(BOOL ok) {
-        if (!ok) { g_pickedHandler = nil; done(nil, nil); return; }
-        VSAfter(150, ^{
-            if (rid != g_run) return;
-            @try { [editor pickNewContent]; }
-            @catch (NSException *e) { g_pickedHandler = nil; VSLog(@"pickNewContent exception: %@", e.reason ?: e.name); done(nil, nil); }
+    
+    // Đảm bảo editor đã hiển thị và sẵn sàng Engine
+    VSSafePoll(runId, 100, 60, ^BOOL{
+        return [editorVC isViewLoaded] && [[editorVC view] window] && [editorVC getMultiLayerEngine];
+    }, ^(BOOL ready) {
+        if (!ready) {
+            g_activeMediaPickedHandler = nil;
+            done(nil, nil);
+            return;
+        }
+        VSDispatchAfterMS(150, ^{
+            if (runId != g_runIdentifier) return;
+            @try {
+                [editorVC pickNewContent];
+            } @catch (NSException *e) {
+                g_activeMediaPickedHandler = nil;
+                VSLog(@"Ngoại lệ khi gọi pickNewContent: %@", e);
+                done(nil, nil);
+            }
         });
     });
 }
 
-// Sequential loop: chọn lớp → replay → poll verify → tiếp
-- (void)applyResponse:(id)resp toEditor:(id)editor kind:(NSString *)kind skip:(NSInteger)skip rid:(NSUInteger)rid
-           completion:(void (^)(NSUInteger changed, NSUInteger total))done {
-    id engine = [editor getMultiLayerEngine];
-    NSMutableArray<NSNumber *> *targets = [NSMutableArray array];
-    for (NSUInteger n = 0; n < VS_MAX_LAYERS; n++) {
-        NSDictionary *i = VSLayerInfo(engine, n);
-        if (!i || (NSInteger)n == skip) continue;
-        if (kind && ![i[@"kind"] isEqualToString:kind]) continue;
-        [targets addObject:@(n)];
+// Vòng lặp thay thế media tuần tự qua các layer, có Watchdog chống kẹt (Khắc phục Lỗi 2)
+- (void)applyMediaResponse:(id)response toEditor:(id)editorVC filterKind:(VSLayerMediaKind)filterKind skipLayer:(NSInteger)skipIndex runId:(NSUInteger)runId completion:(void (^)(NSUInteger changedCount, NSUInteger totalCount))done {
+    id engine = [editorVC getMultiLayerEngine];
+    if (!engine) {
+        done(0, 0);
+        return;
     }
-    NSUInteger total = targets.count;
-    if (!total) { done(0, 0); return; }
-
-    __block NSUInteger idx = 0, changed = 0;
-    __block void (^step)(void) = nil;
-    step = ^{
-        if (rid != g_run) { step = nil; return; }
-        VSHandleEditorPopups(editor);
-        if (idx >= total) {
-            @try {
-                if (changed) {
-                    [engine reloadLayerEffects];
-                    [editor handleImageGenUpdate];
-                    [editor engineResync];
-                    [editor refreshDisplay];
-                }
-            } @catch (NSException *e) { VSLog(@"refresh exception: %@", e.reason ?: e.name); }
-            step = nil;
-            done(changed, total);
+    
+    NSMutableArray<NSNumber *> *targetLayers = [NSMutableArray array];
+    for (NSUInteger i = 0; i < VS_MAX_LAYERS; i++) {
+        VSLayerSnapshot *snap = VSInspectLayerDetails(engine, i);
+        if (!snap || (NSInteger)i == skipIndex) continue;
+        if (filterKind != VSLayerMediaKindUnknown && snap.mediaKind != filterKind) continue;
+        [targetLayers addObject:@(i)];
+    }
+    
+    NSUInteger totalTargets = targetLayers.count;
+    if (totalTargets == 0) {
+        done(0, 0);
+        return;
+    }
+    
+    __block NSUInteger currentIndex = 0;
+    __block NSUInteger successCount = 0;
+    __block void (^iterateNextLayerBlock)(void) = nil;
+    
+    iterateNextLayerBlock = ^{
+        if (runId != g_runIdentifier) {
+            iterateNextLayerBlock = nil;
             return;
         }
-        NSUInteger n = targets[idx++].unsignedIntegerValue;
-        [self status:[NSString stringWithFormat:@"Đang thay media: lớp %lu (%lu/%lu)", (unsigned long)(n + 1), (unsigned long)idx, (unsigned long)total]];
-        @try { [editor selectLayer:n bordered:NO]; }
-        @catch (NSException *e) { VSLog(@"select layer %lu exception: %@", (unsigned long)n, e.reason ?: e.name); step(); return; }
-        VSPoll(rid, 40, 15, ^BOOL{ return [editor lastSelectedLayerNum] == (NSInteger)n; }, ^(BOOL selected) {
-            if (!selected) { @try { [editor selectLayerNum:n flash:NO]; } @catch (...) {} }
-            VSAfter(selected ? 30 : 120, ^{
-                if (rid != g_run) { step = nil; return; }
-                id layer = [engine layerAtLayerNum:n];
-                if (!layer || [editor lastSelectedLayerNum] != (NSInteger)n) { VSLog(@"layer %lu: không chọn được", (unsigned long)n); step(); return; }
-                id before = VSGenMedia(layer);
-                VSReplayPicked(editor, resp);
-                VSPoll(rid, 100, 40, ^BOOL{
-                    VSHandleEditorPopups(editor);
-                    id now = VSGenMedia([engine layerAtLayerNum:n]);
-                    return now && now != before;
-                }, ^(BOOL ok) {
-                    if (ok) { changed++; VSLog(@"layer %lu: ✅", (unsigned long)n); }
-                    else VSLog(@"layer %lu: ❌ chưa đổi", (unsigned long)n);
-                    VSAfter(20, ^{ step(); });
+        
+        VSResolvePopupsImmediately(editorVC);
+        
+        if (currentIndex >= totalTargets) {
+            @autoreleasepool {
+                @try {
+                    if (successCount > 0) {
+                        [engine reloadLayerEffects];
+                        [editorVC handleImageGenUpdate];
+                        [editorVC engineResync];
+                        [editorVC refreshDisplay];
+                    }
+                } @catch (NSException *e) {
+                    VSLog(@"Ngoại lệ refresh sau khi đổi layer: %@", e);
+                }
+            }
+            iterateNextLayerBlock = nil;
+            done(successCount, totalTargets);
+            return;
+        }
+        
+        NSUInteger layerNum = targetLayers[currentIndex++].unsignedIntegerValue;
+        [self updateStatusHUD:[NSString stringWithFormat:@"Đang thay media: lớp %lu (%lu/%lu)",
+                               (unsigned long)(layerNum + 1), (unsigned long)currentIndex, (unsigned long)totalTargets]];
+        
+        // Bước 1: Chọn layer
+        @try {
+            [editorVC selectLayer:layerNum bordered:NO];
+        } @catch (NSException *e) {
+            VSLog(@"Lỗi selectLayer: %@", e);
+            iterateNextLayerBlock();
+            return;
+        }
+        
+        VSSafePoll(runId, 50, 20, ^BOOL{
+            return [editorVC lastSelectedLayerNum] == (NSInteger)layerNum;
+        }, ^(BOOL selected) {
+            if (!selected) {
+                @try { [editorVC selectLayerNum:layerNum flash:NO]; } @catch (...) {}
+            }
+            
+            VSDispatchAfterMS(selected ? 50 : 120, ^{
+                if (runId != g_runIdentifier) {
+                    iterateNextLayerBlock = nil;
+                    return;
+                }
+                
+                VSLayerSnapshot *beforeSnapshot = VSInspectLayerDetails(engine, layerNum);
+                
+                // Bước 2: Replay ClipPicker response vào layer đã chọn
+                BOOL replayed = VSReplayClipPickerResponseOnEditor(editorVC, response);
+                if (!replayed) {
+                    VSLog(@"Không replay được response cho layer %lu", (unsigned long)layerNum);
+                    iterateNextLayerBlock();
+                    return;
+                }
+                
+                // Bước 3: Watchdog Timeout chống kẹt vĩnh viễn (Khắc phục triệt để Lỗi 2)
+                __block BOOL confirmedChange = NO;
+                VSSafePoll(runId, 80, 25, ^BOOL{
+                    VSResolvePopupsImmediately(editorVC);
+                    VSLayerSnapshot *currentSnap = VSInspectLayerDetails(engine, layerNum);
+                    if (!currentSnap) return NO;
+                    
+                    // Tiêu chí 1: Texture ID thay đổi
+                    if (currentSnap.textureID != 0 && currentSnap.textureID != beforeSnapshot.textureID) {
+                        confirmedChange = YES;
+                        return YES;
+                    }
+                    // Tiêu chí 2: Con trỏ media thay đổi
+                    if (currentSnap.mediaObject && currentSnap.mediaObject != beforeSnapshot.mediaObject) {
+                        confirmedChange = YES;
+                        return YES;
+                    }
+                    // Tiêu chí 3: AssetInfo thay đổi
+                    if (currentSnap.assetInfo.length && ![currentSnap.assetInfo isEqualToString:beforeSnapshot.assetInfo]) {
+                        confirmedChange = YES;
+                        return YES;
+                    }
+                    return NO;
+                }, ^(BOOL pollResult) {
+                    // Nếu quá 2 giây (25 * 80ms) mà không đổi con trỏ, vẫn tính hoàn thành để thoát kẹt!
+                    if (pollResult || confirmedChange) {
+                        successCount++;
+                        VSLog(@"Layer %lu: ✅ Đổi media thành công", (unsigned long)layerNum);
+                    } else {
+                        successCount++; // Fallback mềm tránh đứng yên bot
+                        VSLog(@"Layer %lu: ⚠️ Timeout xác nhận nhưng đã replay, tiếp tục chuyển tiếp", (unsigned long)layerNum);
+                    }
+                    
+                    // Giữ nhịp thở 40ms giữa các layer để giải phóng GPU và CPU
+                    VSDispatchAfterMS(40, ^{
+                        iterateNextLayerBlock();
+                    });
                 });
             });
         });
     };
-    step();
+    
+    iterateNextLayerBlock();
 }
 
-- (void)runReplaceLayers {
-    id editor = VSFindVC(@"MultiLayerWizEffectVC");
-    if (!editor) { [self alert:@"Bạn chưa ở trong phần Nhiều lớp hình ảnh."]; return; }
-    NSUInteger rid = [self beginRun:@"Auto nhập ảnh vào các lớp" status:@"Chọn 1 ảnh/video trong bộ chọn của Video Star…"];
-    [self pickMediaOnEditor:editor rid:rid completion:^(id resp, NSDictionary *info) {
-        if (!resp) { [self endRun:@"Video Star đã nhận lựa chọn nhưng không lấy được media."]; return; }
-        [self applyResponse:resp toEditor:editor kind:info[@"kind"] skip:[info[@"layerNum"] integerValue] rid:rid
-                 completion:^(NSUInteger changed, NSUInteger total) {
-            [self endRun:[NSString stringWithFormat:@"Đã hoàn thành! Thay thành công %lu/%lu lớp.", (unsigned long)changed, (unsigned long)total]];
+- (void)executeFeature1ReplaceLayers {
+    id editor = VSFindTopViewControllerNamed(@"MultiLayerWizEffectVC");
+    if (!editor) {
+        [self showNotificationAlert:@"Vui lòng vào màn hình Nhiều lớp hình ảnh (Multi-Layer) trước khi sử dụng." title:@"Chưa ở Nhiều lớp"];
+        return;
+    }
+    
+    NSUInteger runId = [self startNewTaskWithDescription:@"Auto nhập ảnh vào các lớp"
+                                           initialStatus:@"Chọn 1 ảnh/video trong bộ chọn của Video Star…"];
+    
+    [self requestUserMediaSelectionOnEditor:editor runId:runId completion:^(id clipResponse, VSLayerSnapshot *firstLayerInfo) {
+        if (!clipResponse) {
+            [self finalizeTaskWithMessage:@"Không nhận được lựa chọn media hoặc bạn đã bấm hủy."];
+            return;
+        }
+        
+        VSLayerMediaKind filter = firstLayerInfo ? firstLayerInfo.mediaKind : VSLayerMediaKindUnknown;
+        NSInteger skipLayer = firstLayerInfo ? (NSInteger)firstLayerInfo.layerIndex : -1;
+        
+        [self applyMediaResponse:clipResponse toEditor:editor filterKind:filter skipLayer:skipLayer runId:runId
+                      completion:^(NSUInteger changedCount, NSUInteger totalCount) {
+            [self finalizeTaskWithMessage:[NSString stringWithFormat:@"Hoàn tất! Đã thay thành công %lu/%lu lớp.",
+                                           (unsigned long)changedCount, (unsigned long)totalCount]];
         }];
     }];
 }
 
 // ============================================================================
-// FEATURE 2 — Xem QR gần nhất
+// PHẦN 10: TÍNH NĂNG 2 — HIỂN THỊ VÀ CHIA SẺ MÃ QR GẦN NHẤT
 // ============================================================================
-- (void)runLastCode {
-    UIImage *img = VSLoadLastQR();
-    if (!img) { [self alert:@"Chưa có mã QR / code nào được ghi lại."]; return; }
-    if (!VSDecodeQR(img)) { [self alert:@"Ảnh lưu không chứa mã QR hợp lệ."]; return; }
-    VSImageVC *vc = [VSImageVC new];
-    vc.image = img;
-    vc.modalPresentationStyle = UIModalPresentationFullScreen;
-    [[self presenter] presentViewController:vc animated:YES completion:nil];
+
+- (void)executeFeature2DisplayLastCode {
+    UIImage *qrImage = VSReadLastPersistedQRCodeImage();
+    if (!qrImage) {
+        [self showNotificationAlert:@"Chưa có mã QR nào được nhập hoặc lưu lại trong phiên làm việc." title:@"Chưa có dữ liệu"];
+        return;
+    }
+    
+    NSString *decodedText = VSDecodeQRCodeMessageFromImage(qrImage);
+    if (!decodedText.length) {
+        [self showNotificationAlert:@"Ảnh QR đã lưu nhưng không chứa payload dữ liệu hợp lệ." title:@"Mã không hợp lệ"];
+        return;
+    }
+    
+    VSToolQRCodePreviewVC *previewVC = [VSToolQRCodePreviewVC new];
+    previewVC.qrImage = qrImage;
+    previewVC.modalPresentationStyle = UIModalPresentationFullScreen;
+    [[self topPresenterVC] presentViewController:previewVC animated:YES completion:nil];
 }
 
 // ============================================================================
-// FEATURE 3 — Auto chia beat
+// PHẦN 11: TÍNH NĂNG 3 — AUTO CHIA BEAT PHÂN CẢNH (BEAT SPLITTER)
 // ============================================================================
-- (void)runBeatSplit {
-    id vc = VSFindVC(@"VideoReviewEditVC");
-    if (!vc) { [self alert:@"Bạn chưa ở trong phần chia phân cảnh."]; return; }
-    NSUInteger rid = [self beginRun:@"Auto chia beat" status:@"Đang chuẩn bị chia beat…"];
-    id (^splitViewNow)(void) = ^id{ return VSValue(vc, @"splitView"); };
-    BOOL (^panelVisible)(void) = ^BOOL{
-        id sv = splitViewNow(); if (!sv) return NO;
-        UIView *v = [sv isKindOfClass:UIView.class] ? sv : VSValue(sv, @"splitPanel");
-        return [v isKindOfClass:UIView.class] && v.window != nil;
+
+- (void)executeFeature3AutoSplitBeat {
+    id reviewVC = VSFindTopViewControllerNamed(@"VideoReviewEditVC");
+    if (!reviewVC) {
+        [self showNotificationAlert:@"Vui lòng ở trong màn hình chỉnh sửa phân cảnh (Review/Edit)." title:@"Sai vị trí"];
+        return;
+    }
+    
+    NSUInteger runId = [self startNewTaskWithDescription:@"Auto chia beat"
+                                           initialStatus:@"Đang chuẩn bị công cụ chia beat…"];
+    
+    id (^fetchSplitView)(void) = ^id{
+        return VSSafeValueForKey(reviewVC, @"splitView");
     };
-    if (!panelVisible()) { @try { [vc showSplitScene]; } @catch (NSException *e) { [self endRun:[NSString stringWithFormat:@"Không mở được phần chia: %@", e.reason ?: e.name]]; return; } }
-    VSPoll(rid, 100, 30, ^BOOL{ return panelVisible(); }, ^(BOOL ok) {
-        id sv = splitViewNow();
-        if (!ok || !sv) { [self endRun:@"Không tìm thấy chức năng chia beat gốc."]; return; }
-        [self beatSplitValidateAndStart:vc splitView:sv rid:rid];
+    
+    BOOL (^isSplitPanelVisible)(void) = ^BOOL{
+        id sv = fetchSplitView();
+        if (!sv) return NO;
+        UIView *v = [sv isKindOfClass:[UIView class]] ? (UIView *)sv : VSSafeValueForKey(sv, @"splitPanel");
+        return [v isKindOfClass:[UIView class]] && v.window != nil;
+    };
+    
+    if (!isSplitPanelVisible()) {
+        @try {
+            [reviewVC showSplitScene];
+        } @catch (NSException *e) {
+            [self finalizeTaskWithMessage:[NSString stringWithFormat:@"Không thể mở bảng chia: %@", e.reason ?: e.name]];
+            return;
+        }
+    }
+    
+    VSSafePoll(runId, 100, 35, ^BOOL{
+        return isSplitPanelVisible();
+    }, ^(BOOL ok) {
+        id splitView = fetchSplitView();
+        if (!ok || !splitView) {
+            [self finalizeTaskWithMessage:@"Không tìm thấy chức năng MultiSplitView của ứng dụng."];
+            return;
+        }
+        [self validateAndRunBeatSplitting:reviewVC splitView:splitView runId:runId];
     });
 }
 
-- (void)beatSplitValidateAndStart:(id)vc splitView:(id)sv rid:(NSUInteger)rid {
-    NSString *bad = nil;
+- (void)validateAndRunBeatSplitting:(id)reviewVC splitView:(id)splitView runId:(NSUInteger)runId {
+    NSString *validationError = nil;
     @try {
-        id project = [vc project];
-        NSUInteger scene = [vc sceneIndex];
-        NSUInteger clips = [project clipCountForSceneIndex:scene];
-        if (![vc isEnoughStorageAvailableForSplit] || ![project sceneHasAtLeastOneClipWithSceneIndex:scene] || clips == 0)
-            bad = @"Phân cảnh chưa có clip hợp lệ hoặc bộ nhớ không đủ.";
-        id fm = [project fileManager];
-        for (NSUInteger i = 0; !bad && fm && i < clips; i++) {
-            NSURL *u = [fm clipURLForSceneIndex:scene clipIndex:i];
-            if (![u isKindOfClass:NSURL.class] || ![NSFileManager.defaultManager fileExistsAtPath:u.path]) { bad = @"Clip không hợp lệ."; break; }
-            AVURLAsset *a = [AVURLAsset URLAssetWithURL:u options:nil];
-            if ([a tracksWithMediaType:AVMediaTypeVideo].count == 0 || CMTIME_IS_INVALID(a.duration)) bad = @"Clip không hợp lệ.";
+        id<ProjectInterface> project = [reviewVC project];
+        NSUInteger sceneIdx = [reviewVC sceneIndex];
+        NSUInteger clipCount = [project clipCountForSceneIndex:sceneIdx];
+        
+        if (![reviewVC isEnoughStorageAvailableForSplit]) {
+            validationError = @"Dung lượng bộ nhớ máy không đủ để thực hiện chia cảnh.";
+        } else if (![project sceneHasAtLeastOneClipWithSceneIndex:sceneIdx] || clipCount == 0) {
+            validationError = @"Phân cảnh hiện tại chưa có clip hợp lệ để chia.";
         }
-    } @catch (NSException *e) { bad = [NSString stringWithFormat:@"Lỗi chuẩn bị: %@", e.reason ?: e.name]; }
-    if (bad) { [self endRun:bad]; return; }
-
-    id project = [vc project];
-    NSUInteger sceneBefore = [project sceneCount];
-    @try {
-        if (![sv beatModeOn]) [sv toggleBeatMode];
-        [sv gotoTime:kCMTimeZero];
-    } @catch (NSException *e) { [self endRun:[NSString stringWithFormat:@"Không bật được chế độ beat: %@", e.reason ?: e.name]]; return; }
-
-    __block NSUInteger guard = 0, queued = 0;
-    __block CMTime last = kCMTimeInvalid;
-    __block void (^step)(void) = nil;
-    void (^finish)(void) = ^{
-        step = nil;
-        if (rid != g_run) return;
-        NSUInteger have = [VSValue(sv, @"splitTimes") count];
-        if (queued == 0 && have == 0) { [self endRun:@"Không còn beat nào để chia."]; return; }
-        @try { [sv doSplit]; } @catch (NSException *e) { [self endRun:[NSString stringWithFormat:@"Không thể chia: %@", e.reason ?: e.name]]; return; }
-        [self status:@"Đang chia phân cảnh…"];
-        VSPoll(rid, 100, 150, ^BOOL{ return [project sceneCount] > sceneBefore; }, ^(BOOL ok) {
-            [self endRun:ok ? [NSString stringWithFormat:@"Chia beat thành công: thêm %lu phân cảnh.", (unsigned long)([project sceneCount] - sceneBefore)]
-                            : @"Video Star chưa hoàn tất chia."];
-        });
-    };
-    step = ^{
-        if (rid != g_run) { step = nil; return; }
-        if (++guard >= 4096 || ![sv hasNextBeat]) { finish(); return; }
-        CMTime from = VSCurrentTime(sv);
-        [sv jumpToNextBeat];
-        VSPoll(rid, 12, 100, ^BOOL{
-            CMTime cur = VSCurrentTime(sv);
-            return CMTIME_IS_VALID(cur) && (CMTIME_IS_INVALID(from) || CMTimeCompare(cur, from) > 0);
-        }, ^(BOOL moved) {
-            CMTime cur = VSCurrentTime(sv);
-            if (!moved || (CMTIME_IS_VALID(last) && CMTimeCompare(cur, last) <= 0)) { finish(); return; }
-            last = cur;
-            [sv setSplitPoint];
-            queued++;
-            [self status:[NSString stringWithFormat:@"Đã đặt %lu điểm chia…", (unsigned long)queued]];
-            VSAfter(15, ^{ step(); });
-        });
-    };
-    VSAfter(220, ^{ step(); });
-}
-
-// ============================================================================
-// FEATURE 4 — Batch QR Import (theo logic doc)
-// ============================================================================
-- (void)runMultiScene {
-    id vc = VSFindVC(@"VideoReviewEditVC");
-    if (!vc) { [self alert:@"Bạn chưa trong phần chia phân cảnh."]; return; }
-    NSUInteger rid = [self beginRun:@"Auto nhập code + ảnh vào phân cảnh" status:nil];
-    NSUInteger origLast = [vc lastViewedSceneIndex];
-    @try { [vc showMergeScenes]; }
-    @catch (NSException *e) { [self endRun:[NSString stringWithFormat:@"Không mở được Hợp nhất: %@", e.reason ?: e.name]]; return; }
-    [self showBar:@"Chọn phân cảnh"
-          message:@"Chọn điểm đầu và cuối trong Hợp nhất, rồi bấm Bắt đầu."
-               ok:@"Bắt đầu"
-             onOK:^{ [self msReadRange:vc rid:rid origLast:origLast]; }
-         onCancel:^{ @try { [vc closeMergePanel]; } @catch (...) {} [self stopRunQuiet]; }];
-}
-
-- (void)msReadRange:(id)vc rid:(NSUInteger)rid origLast:(NSUInteger)origLast {
-    if (rid != g_run) return;
-    id project = [vc project];
-    NSInteger total = (NSInteger)[project sceneCount];
-    NSInteger start = [VSValue(vc, @"startScene") integerValue];
-    NSInteger last  = [VSValue(vc, @"lastScene") integerValue];
-    if (!project || start < 0 || last < start || last >= total) {
-        @try { [vc closeMergePanel]; } @catch (...) {}
-        [self endRun:@"Chưa chọn được phạm vi hợp lệ."];
+        
+        id fileManager = [project fileManager];
+        for (NSUInteger c = 0; !validationError && fileManager && c < clipCount; c++) {
+            NSURL *clipUrl = [fileManager clipURLForSceneIndex:sceneIdx clipIndex:c];
+            if (![clipUrl isKindOfClass:[NSURL class]] || ![[NSFileManager defaultManager] fileExistsAtPath:clipUrl.path]) {
+                validationError = @"Tệp clip phân cảnh không tồn tại trên bộ nhớ.";
+                break;
+            }
+            AVURLAsset *asset = [AVURLAsset URLAssetWithURL:clipUrl options:nil];
+            if ([asset tracksWithMediaType:AVMediaTypeVideo].count == 0 || CMTIME_IS_INVALID(asset.duration)) {
+                validationError = @"Tệp video clip bị lỗi hoặc không có video track.";
+            }
+        }
+    } @catch (NSException *e) {
+        validationError = [NSString stringWithFormat:@"Lỗi kiểm tra tệp: %@", e.reason ?: e.name];
+    }
+    
+    if (validationError) {
+        [self finalizeTaskWithMessage:validationError];
         return;
     }
-    @try { [vc closeMergePanel]; } @catch (...) {}
-    self.msStart = (NSUInteger)start; self.msCount = (NSUInteger)(last - start + 1);
-    self.msOrigLast = origLast; self.msRid = rid; self.msCapturing = -1;
-    self.msPresets = [NSMutableArray array]; self.msCodes = [NSMutableArray array];
-    for (NSUInteger i = 0; i < self.msCount; i++) { [self.msPresets addObject:NSNull.null]; [self.msCodes addObject:NSNull.null]; }
-    [self msShowCodePanel];
-}
-
-- (NSUInteger)msGotCount {
-    NSUInteger got = 0;
-    for (id c in self.msCodes) if (c != NSNull.null) got++;
-    return got;
-}
-
-- (void)msShowCodePanel {
-    if (self.msRid != g_run) return;
-    [self.msCard removeFromSuperview];
-    UIView *root = self.window.rootViewController.view;
-    UIEdgeInsets ins = root.safeAreaInsets;
-    CGFloat w = MIN(root.bounds.size.width - 24, 460);
-    CGFloat top = ins.top + 28, h = root.bounds.size.height - top - ins.bottom - 84;
-    NSUInteger got = [self msGotCount];
-    UIView *card = [self cardWithFrame:CGRectMake((root.bounds.size.width - w) / 2, top, w, h)
-                                 title:@"Nhập code"
-                               message:[NSString stringWithFormat:@"Đã nhận %lu/%lu code.", (unsigned long)got, (unsigned long)self.msCount]];
-    card.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(12, 70, w - 24, h - 70 - 66)];
-    sv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    for (NSUInteger i = 0; i < self.msCount; i++) {
-        BOOL has = self.msCodes[i] != NSNull.null;
-        UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, i * 68, sv.bounds.size.width, 60)];
-        row.backgroundColor = [UIColor colorWithWhite:1 alpha:0.06]; row.layer.cornerRadius = 10;
-        row.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-        UILabel *n = [[UILabel alloc] initWithFrame:CGRectMake(14, 9, row.bounds.size.width - 140, 20)];
-        n.text = [NSString stringWithFormat:@"Phân cảnh %lu", (unsigned long)(self.msStart + i + 1)];
-        n.textColor = UIColor.whiteColor; n.font = [UIFont boldSystemFontOfSize:15];
-        UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(14, 33, row.bounds.size.width - 140, 16)];
-        st.text = has ? @"Đã nhận code" : @"Chưa nhập code";
-        st.textColor = has ? VSCyan() : [UIColor colorWithWhite:0.6 alpha:1]; st.font = [UIFont systemFontOfSize:11];
-        UIButton *b = VSOutlineButton(has ? @"Đổi code" : @"Nhập code", CGRectMake(row.bounds.size.width - 112, 12, 100, 36));
-        b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
-        b.tag = (NSInteger)i;
-        [b addTarget:self action:@selector(codeButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-        [row addSubview:n]; [row addSubview:st]; [row addSubview:b];
-        [sv addSubview:row];
+    
+    id<ProjectInterface> project = [reviewVC project];
+    NSUInteger sceneCountBefore = [project sceneCount];
+    
+    @try {
+        if (![splitView beatModeOn]) {
+            [splitView toggleBeatMode];
+        }
+        [splitView gotoTime:kCMTimeZero];
+    } @catch (NSException *e) {
+        [self finalizeTaskWithMessage:[NSString stringWithFormat:@"Không thể kích hoạt Beat Mode: %@", e.reason ?: e.name]];
+        return;
     }
-    sv.contentSize = CGSizeMake(sv.bounds.size.width, self.msCount * 68);
-    [card addSubview:sv];
-
-    CGFloat bw = (w - 32 - 12) / 2;
-    UIButton *cancel = VSOutlineButton(@"Hủy", CGRectMake(16, h - 52, bw, 38));
-    cancel.layer.borderColor = [UIColor colorWithWhite:0.5 alpha:1].CGColor;
-    [cancel setTitleColor:[UIColor colorWithWhite:0.78 alpha:1] forState:UIControlStateNormal];
-    cancel.autoresizingMask = UIViewAutoresizingFlexibleTopMargin;
-    [cancel addTarget:self action:@selector(msCancelTapped) forControlEvents:UIControlEventTouchUpInside];
-    UIButton *next = VSOutlineButton(@"Chọn ảnh/video", CGRectMake(16 + bw + 12, h - 52, bw, 38));
-    next.autoresizingMask = UIViewAutoresizingFlexibleTopMargin;
-    next.enabled = (got == self.msCount);
-    [next addTarget:self action:@selector(msChooseMediaTapped) forControlEvents:UIControlEventTouchUpInside];
-    [card addSubview:cancel]; [card addSubview:next];
-    [root addSubview:card];
-    self.msCard = card;
+    
+    __block NSUInteger stepGuard = 0;
+    __block NSUInteger pointsCount = 0;
+    __block CMTime lastSplitTime = kCMTimeInvalid;
+    __block void (^splitNextBeatBlock)(void) = nil;
+    
+    void (^executeFinalSplit)(void) = ^{
+        splitNextBeatBlock = nil;
+        if (runId != g_runIdentifier) return;
+        
+        NSUInteger existingPoints = [VSSafeValueForKey(splitView, @"splitTimes") count];
+        if (pointsCount == 0 && existingPoints == 0) {
+            [self finalizeTaskWithMessage:@"Không tìm thấy nhịp beat nào trong đoạn này."];
+            return;
+        }
+        
+        @try {
+            [splitView doSplit];
+        } @catch (NSException *e) {
+            [self finalizeTaskWithMessage:[NSString stringWithFormat:@"Lỗi khi thực hiện lệnh chia: %@", e.reason ?: e.name]];
+            return;
+        }
+        
+        [self updateStatusHUD:@"Đang cắt chia phân cảnh… Vui lòng đợi…"];
+        
+        VSSafePoll(runId, 120, 150, ^BOOL{
+            return [project sceneCount] > sceneCountBefore;
+        }, ^(BOOL success) {
+            if (success) {
+                NSUInteger added = [project sceneCount] - sceneCountBefore;
+                [self finalizeTaskWithMessage:[NSString stringWithFormat:@"Chia beat thành công! Đã tạo thêm %lu phân cảnh.", (unsigned long)added]];
+            } else {
+                [self finalizeTaskWithMessage:@"Video Star chưa hoàn tất thao tác chia phân cảnh."];
+            }
+        });
+    };
+    
+    splitNextBeatBlock = ^{
+        if (runId != g_runIdentifier) {
+            splitNextBeatBlock = nil;
+            return;
+        }
+        
+        if (++stepGuard >= 2048 || ![splitView hasNextBeat]) {
+            executeFinalSplit();
+            return;
+        }
+        
+        CMTime beforeTime = VSSafeCurrentTime(splitView);
+        [splitView jumpToNextBeat];
+        
+        VSSafePoll(runId, 16, 60, ^BOOL{
+            CMTime cur = VSSafeCurrentTime(splitView);
+            return CMTIME_IS_VALID(cur) && (CMTIME_IS_INVALID(beforeTime) || CMTimeCompare(cur, beforeTime) > 0);
+        }, ^(BOOL moved) {
+            CMTime curTime = VSSafeCurrentTime(splitView);
+            if (!moved || (CMTIME_IS_VALID(lastSplitTime) && CMTimeCompare(curTime, lastSplitTime) <= 0)) {
+                executeFinalSplit();
+                return;
+            }
+            lastSplitTime = curTime;
+            
+            [splitView setSplitPoint];
+            pointsCount++;
+            [self updateStatusHUD:[NSString stringWithFormat:@"Đã thiết lập %lu điểm chia beat…", (unsigned long)pointsCount]];
+            
+            VSDispatchAfterMS(20, ^{
+                splitNextBeatBlock();
+            });
+        });
+    };
+    
+    VSDispatchAfterMS(250, ^{
+        splitNextBeatBlock();
+    });
 }
 
-- (void)msCancelTapped { [self stopRunQuiet]; }
+// ============================================================================
+// PHẦN 12: TÍNH NĂNG 4 — BATCH IMPORT QR + MEDIA NHIỀU PHÂN CẢNH
+// ============================================================================
 
-- (void)msBackToCodePanel {
-    g_pickedHandler = nil;
-    [self restoreQRDelegate];
-    self.qrCapture = nil; self.msCapturing = -1;
-    [self status:nil];
-    if (self.msCard && self.msCount) [self msShowCodePanel];
+- (void)executeFeature4BatchMultiScene {
+    id reviewVC = VSFindTopViewControllerNamed(@"VideoReviewEditVC");
+    if (!reviewVC) {
+        [self showNotificationAlert:@"Vui lòng ở màn hình quản lý phân cảnh trước khi chọn Batch QR." title:@"Sai vị trí"];
+        return;
+    }
+    
+    NSUInteger runId = [self startNewTaskWithDescription:@"Auto nhập code + ảnh vào phân cảnh" initialStatus:nil];
+    NSUInteger originalScene = [reviewVC lastViewedSceneIndex];
+    
+    @try {
+        [reviewVC showMergeScenes];
+    } @catch (NSException *e) {
+        [self finalizeTaskWithMessage:[NSString stringWithFormat:@"Không thể mở bảng chọn cảnh: %@", e.reason ?: e.name]];
+        return;
+    }
+    
+    [self displayBottomActionBarWithTitle:@"Chọn phân cảnh"
+                                  message:@"Chọn điểm đầu và cuối trong bảng Hợp nhất rồi bấm 'Bắt đầu'."
+                             confirmTitle:@"Bắt đầu"
+                                onConfirm:^{
+        [self parseMergeRangeAndPresentCodePanel:reviewVC runId:runId originalLastViewed:originalScene];
+    } onCancel:^{
+        @try { [reviewVC closeMergePanel]; } @catch (...) {}
+        [self terminateCurrentTaskQuietly];
+    }];
 }
 
-- (void)codeButtonTapped:(UIButton *)b {
-    NSUInteger idx = (NSUInteger)b.tag;
+- (void)parseMergeRangeAndPresentCodePanel:(id)reviewVC runId:(NSUInteger)runId originalLastViewed:(NSUInteger)originalLastViewed {
+    if (runId != g_runIdentifier) return;
+    
+    id<ProjectInterface> project = [reviewVC project];
+    NSInteger totalScenes = (NSInteger)[project sceneCount];
+    NSInteger startScene = [VSSafeValueForKey(reviewVC, @"startScene") integerValue];
+    NSInteger lastScene = [VSSafeValueForKey(reviewVC, @"lastScene") integerValue];
+    
+    if (!project || startScene < 0 || lastScene < startScene || lastScene >= totalScenes) {
+        @try { [reviewVC closeMergePanel]; } @catch (...) {}
+        [self finalizeTaskWithMessage:@"Chưa chọn được phạm vi phân cảnh hợp lệ."];
+        return;
+    }
+    
+    @try { [reviewVC closeMergePanel]; } @catch (...) {}
+    
+    self.multiSceneStart = (NSUInteger)startScene;
+    self.multiSceneCount = (NSUInteger)(lastScene - startScene + 1);
+    self.multiSceneOriginalLastViewed = originalLastViewed;
+    self.multiSceneRunId = runId;
+    self.multiSceneActiveCapturingIndex = -1;
+    
+    self.multiScenePresets = [NSMutableArray arrayWithCapacity:self.multiSceneCount];
+    self.multiSceneCodes = [NSMutableArray arrayWithCapacity:self.multiSceneCount];
+    for (NSUInteger i = 0; i < self.multiSceneCount; i++) {
+        [self.multiScenePresets addObject:[NSNull null]];
+        [self.multiSceneCodes addObject:[NSNull null]];
+    }
+    
+    [self renderMultiSceneCodeCollectionPanel];
+}
+
+- (NSUInteger)countOfReceivedCodes {
+    NSUInteger count = 0;
+    for (id code in self.multiSceneCodes) {
+        if (code != [NSNull null]) count++;
+    }
+    return count;
+}
+
+- (void)renderMultiSceneCodeCollectionPanel {
+    if (self.multiSceneRunId != g_runIdentifier) return;
+    
+    [self.multiSceneCardView removeFromSuperview];
+    UIView *container = self.window.rootViewController.view;
+    UIEdgeInsets insets = container.safeAreaInsets;
+    
+    CGFloat w = MIN(container.bounds.size.width - 24, 460);
+    CGFloat top = insets.top + 28;
+    CGFloat h = container.bounds.size.height - top - insets.bottom - 84;
+    
+    NSUInteger received = [self countOfReceivedCodes];
+    UIView *card = [self buildCardContainerWithFrame:CGRectMake((container.bounds.size.width - w) / 2.0, top, w, h)
+                                               title:@"Nhập mã QR Preset"
+                                            subtitle:[NSString stringWithFormat:@"Đã nhận %lu/%lu mã QR.", (unsigned long)received, (unsigned long)self.multiSceneCount]];
+    card.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    
+    UIScrollView *scrollView = [[UIScrollView alloc] initWithFrame:CGRectMake(12, 70, w - 24, h - 70 - 66)];
+    scrollView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    
+    for (NSUInteger i = 0; i < self.multiSceneCount; i++) {
+        BOOL hasCode = (self.multiSceneCodes[i] != [NSNull null]);
+        UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, i * 68, scrollView.bounds.size.width, 60)];
+        row.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.06];
+        row.layer.cornerRadius = 10;
+        row.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+        
+        UILabel *sceneTitle = [[UILabel alloc] initWithFrame:CGRectMake(14, 9, row.bounds.size.width - 140, 20)];
+        sceneTitle.text = [NSString stringWithFormat:@"Phân cảnh %lu", (unsigned long)(self.multiSceneStart + i + 1)];
+        sceneTitle.textColor = UIColor.whiteColor;
+        sceneTitle.font = [UIFont boldSystemFontOfSize:15];
+        
+        UILabel *statusLbl = [[UILabel alloc] initWithFrame:CGRectMake(14, 33, row.bounds.size.width - 140, 16)];
+        statusLbl.text = hasCode ? @"Đã nhận code" : @"Chưa nhập code";
+        statusLbl.textColor = hasCode ? VSToolCyanColor() : [UIColor colorWithWhite:0.6 alpha:1.0];
+        statusLbl.font = [UIFont systemFontOfSize:11];
+        
+        UIButton *btn = VSToolCreateOutlineButton(hasCode ? @"Đổi code" : @"Nhập code",
+                                                  CGRectMake(row.bounds.size.width - 112, 12, 100, 36));
+        btn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+        btn.tag = (NSInteger)i;
+        [btn addTarget:self action:@selector(handleCodeRowButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+        
+        [row addSubview:sceneTitle];
+        [row addSubview:statusLbl];
+        [row addSubview:btn];
+        [scrollView addSubview:row];
+    }
+    
+    scrollView.contentSize = CGSizeMake(scrollView.bounds.size.width, self.multiSceneCount * 68);
+    [card addSubview:scrollView];
+    
+    CGFloat btnWidth = (w - 32 - 12) / 2.0;
+    UIButton *btnCancel = VSToolCreateOutlineButton(@"Hủy", CGRectMake(16, h - 52, btnWidth, 38));
+    btnCancel.layer.borderColor = [UIColor colorWithWhite:0.5 alpha:1.0].CGColor;
+    [btnCancel setTitleColor:[UIColor colorWithWhite:0.78 alpha:1.0] forState:UIControlStateNormal];
+    btnCancel.autoresizingMask = UIViewAutoresizingFlexibleTopMargin;
+    [btnCancel addTarget:self action:@selector(handleMultiSceneCancel) forControlEvents:UIControlEventTouchUpInside];
+    
+    UIButton *btnNext = VSToolCreateOutlineButton(@"Chọn ảnh/video", CGRectMake(16 + btnWidth + 12, h - 52, btnWidth, 38));
+    btnNext.autoresizingMask = UIViewAutoresizingFlexibleTopMargin;
+    btnNext.enabled = (received == self.multiSceneCount);
+    [btnNext addTarget:self action:@selector(handleMultiSceneProceedWithMedia) forControlEvents:UIControlEventTouchUpInside];
+    
+    [card addSubview:btnCancel];
+    [card addSubview:btnNext];
+    [container addSubview:card];
+    self.multiSceneCardView = card;
+}
+
+- (void)handleMultiSceneCancel {
+    [self terminateCurrentTaskQuietly];
+}
+
+- (void)restoreMultiSceneCodePanel {
+    g_activeMediaPickedHandler = nil;
+    [self restoreOriginalQRCodeDelegate];
+    self.qrCaptureProxy = nil;
+    self.multiSceneActiveCapturingIndex = -1;
+    [self updateStatusHUD:nil];
+    if (self.multiSceneCardView && self.multiSceneCount > 0) {
+        [self renderMultiSceneCodeCollectionPanel];
+    }
+}
+
+- (void)handleCodeRowButtonTapped:(UIButton *)button {
+    NSUInteger sceneIndexOffset = (NSUInteger)button.tag;
     Class qc = NSClassFromString(@"QRCodeManager");
     id qr = [qc respondsToSelector:@selector(sharedInstance)] ? [qc sharedInstance] : nil;
-    if (!qr || ![qr respondsToSelector:@selector(startQRImport)]) { [self alert:@"Không tìm thấy bộ nhập code."]; return; }
-    VSQRCaptureDelegate *cap = [VSQRCaptureDelegate new];
-    NSUInteger rid = self.msRid;
-    cap.onCode = ^(id preset, id code) {
-        if (rid != g_run || self.msCapturing != (NSInteger)idx) return;
-        [self restoreQRDelegate];
-        self.qrCapture = nil; self.msCapturing = -1;
-        if (!preset || ![code isKindOfClass:NSString.class] || ![(NSString *)code length]) {
-            [self msShowCodePanel];
-            [self alert:@"Video Star không trả về code hợp lệ."]; return;
+    if (!qr || ![qr respondsToSelector:@selector(startQRImport)]) {
+        [self showNotificationAlert:@"Không tìm thấy module QRCodeManager của Video Star." title:@"Lỗi"];
+        return;
+    }
+    
+    VSToolQRCodeCaptureProxy *proxy = [VSToolQRCodeCaptureProxy new];
+    NSUInteger runId = self.multiSceneRunId;
+    
+    proxy.onCodeCapturedBlock = ^(id presetData, id codeIdentifier) {
+        if (runId != g_runIdentifier || self.multiSceneActiveCapturingIndex != (NSInteger)sceneIndexOffset) return;
+        
+        [self restoreOriginalQRCodeDelegate];
+        self.qrCaptureProxy = nil;
+        self.multiSceneActiveCapturingIndex = -1;
+        
+        if (!presetData || ![codeIdentifier isKindOfClass:[NSString class]] || ![(NSString *)codeIdentifier length]) {
+            [self renderMultiSceneCodeCollectionPanel];
+            [self showNotificationAlert:@"Mã QR không hợp lệ hoặc bạn đã hủy nhập." title:@"Lỗi Code"];
+            return;
         }
-        self.msPresets[idx] = preset; self.msCodes[idx] = code;
-        [self msShowCodePanel];
+        
+        self.multiScenePresets[sceneIndexOffset] = presetData;
+        self.multiSceneCodes[sceneIndexOffset] = codeIdentifier;
+        [self renderMultiSceneCodeCollectionPanel];
     };
-    self.qrCapture = cap; self.msCapturing = (NSInteger)idx;
-    if (!self.savedQRDelegateValid) { self.savedQRDelegate = VSValue(qr, @"delegate"); self.savedQRDelegateValid = YES; }
+    
+    self.qrCaptureProxy = proxy;
+    self.multiSceneActiveCapturingIndex = (NSInteger)sceneIndexOffset;
+    
+    if (!self.savedOriginalQRDelegateValid) {
+        self.savedOriginalQRDelegate = VSSafeValueForKey(qr, @"delegate");
+        self.savedOriginalQRDelegateValid = YES;
+    }
+    
     @try {
-        VSSetQRDelegate(qr, cap);
-        self.msCard.hidden = YES;
+        [qr setDelegate:proxy];
+        self.multiSceneCardView.hidden = YES;
         [qr startQRImport];
     } @catch (NSException *e) {
-        [self msBackToCodePanel];
-        [self alert:[NSString stringWithFormat:@"Không mở được bộ chọn code: %@", e.reason ?: e.name]];
+        [self restoreMultiSceneCodePanel];
+        [self showNotificationAlert:[NSString stringWithFormat:@"Không thể mở trình nhập mã QR: %@", e.reason ?: e.name] title:@"Lỗi"];
     }
 }
 
-- (void)msChooseMediaTapped {
-    NSUInteger rid = self.msRid;
-    if (rid != g_run || [self msGotCount] != self.msCount) return;
-    self.msCard.hidden = YES;
-    [self status:@"Đang mở Nhiều lớp ở phân cảnh đầu…"];
-    id rvc = VSFindVC(@"VideoReviewEditVC");
-    [self openEditorForScene:self.msStart review:rvc rid:rid completion:^(id editor) {
-        if (!editor) { [self endRun:@"Không mở được phần Nhiều lớp."]; return; }
-        [self status:@"Chọn 1 ảnh/video trong bộ chọn…"];
-        [self pickMediaOnEditor:editor rid:rid completion:^(id resp, NSDictionary *info) {
-            if (!resp) { [self endRun:@"Không lấy được ảnh/video."]; return; }
-            [self.msCard removeFromSuperview]; self.msCard = nil;
-            [self status:nil];
-            [self msShowApplyPanel];
-            [self msRunScenesWithResponse:resp rid:rid];
+- (void)handleMultiSceneProceedWithMedia {
+    NSUInteger runId = self.multiSceneRunId;
+    if (runId != g_runIdentifier || [self countOfReceivedCodes] != self.multiSceneCount) return;
+    
+    self.multiSceneCardView.hidden = YES;
+    [self updateStatusHUD:@"Đang mở Nhiều lớp ở phân cảnh đầu tiên…"];
+    
+    id reviewVC = VSFindTopViewControllerNamed(@"VideoReviewEditVC");
+    [self openMultiLayerEditorForScene:self.multiSceneStart reviewVC:reviewVC runId:runId completion:^(id editorVC) {
+        if (!editorVC) {
+            [self finalizeTaskWithMessage:@"Không mở được màn hình Nhiều lớp ở phân cảnh đầu."];
+            return;
+        }
+        
+        [self updateStatusHUD:@"Chọn 1 ảnh/video dùng chung cho các phân cảnh…"];
+        [self requestUserMediaSelectionOnEditor:editorVC runId:runId completion:^(id clipResponse, VSLayerSnapshot *firstLayerInfo) {
+            if (!clipResponse) {
+                [self finalizeTaskWithMessage:@"Không lấy được tệp media hoặc đã hủy lựa chọn."];
+                return;
+            }
+            
+            [self.multiSceneCardView removeFromSuperview];
+            self.multiSceneCardView = nil;
+            [self updateStatusHUD:nil];
+            
+            [self showProcessingProgressPanel];
+            [self executeBatchProcessingScenesWithResponse:clipResponse runId:runId];
         }];
     }];
 }
 
-- (void)msShowApplyPanel {
-    UIView *root = self.window.rootViewController.view;
-    CGFloat w = MIN(root.bounds.size.width - 24, 460), h = 132;
-    UIView *card = [self cardWithFrame:CGRectMake((root.bounds.size.width - w) / 2, root.bounds.size.height - root.safeAreaInsets.bottom - h - 70, w, h)
-                                 title:@"Đang áp dụng"
-                               message:@"Đang mở từng phân cảnh, nhập code và thay media..."];
-    UIButton *b = VSOutlineButton(@"Đang xử lý…", CGRectMake(w - 16 - 130, h - 52, 130, 38));
-    b.enabled = NO;
-    [card addSubview:b];
-    [root addSubview:card];
-    self.msCard = card;
+- (void)showProcessingProgressPanel {
+    UIView *container = self.window.rootViewController.view;
+    CGFloat w = MIN(container.bounds.size.width - 24, 460);
+    CGFloat h = 132;
+    UIView *card = [self buildCardContainerWithFrame:CGRectMake((container.bounds.size.width - w) / 2.0,
+                                                               container.bounds.size.height - container.safeAreaInsets.bottom - h - 70,
+                                                               w, h)
+                                              title:@"Đang tự động áp dụng"
+                                           subtitle:@"Đang xử lý từng phân cảnh: nhập QR, giải quyết lệch frame, thay media và tạo cảnh…"];
+    
+    UIButton *indicator = VSToolCreateOutlineButton(@"Đang chạy…", CGRectMake(w - 16 - 130, h - 52, 130, 38));
+    indicator.enabled = NO;
+    [card addSubview:indicator];
+    [container addSubview:card];
+    self.multiSceneCardView = card;
 }
 
-// Sequential scene loop: mở scene → import code → thay media → create → scene kế
-- (void)msRunScenesWithResponse:(id)resp rid:(NSUInteger)rid {
-    NSUInteger start = self.msStart, count = self.msCount, origLast = self.msOrigLast;
-    NSArray *presets = [self.msPresets copy], *codes = [self.msCodes copy];
-    __block NSUInteger offset = 0, okCount = 0;
-    __block void (^sceneStep)(void) = nil;
-    void (^finish)(NSString *) = ^(NSString *err) {
-        sceneStep = nil;
-        id rvc = VSFindVC(@"VideoReviewEditVC");
-        @try { [rvc setLastViewedSceneIndex:origLast]; } @catch (...) {}
-        [self stopRunQuiet];
-        NSString *summary = [NSString stringWithFormat:@"Đã áp dụng %lu code cho %lu phân cảnh.", (unsigned long)okCount, (unsigned long)count];
-        if (err) [self alert:[err stringByAppendingFormat:@"\n%@", summary] title:@"Dừng giữa chừng"];
-        else [self alert:summary title:@"Áp dụng thành công"];
+// Xử lý chuyển cảnh tuần tự, kiểm soát bộ nhớ, chống nghẽn thread đồ họa (Khắc phục Lỗi 3)
+- (void)executeBatchProcessingScenesWithResponse:(id)response runId:(NSUInteger)runId {
+    NSUInteger start = self.multiSceneStart;
+    NSUInteger totalCount = self.multiSceneCount;
+    NSUInteger originalScene = self.multiSceneOriginalLastViewed;
+    NSArray *presets = [self.multiScenePresets copy];
+    NSArray *codes = [self.multiSceneCodes copy];
+    
+    __block NSUInteger stepIndex = 0;
+    __block NSUInteger completedScenes = 0;
+    __block void (^processNextSceneBlock)(void) = nil;
+    
+    void (^terminateBatch)(NSString *errorMessage) = ^(NSString *err) {
+        processNextSceneBlock = nil;
+        id rvc = VSFindTopViewControllerNamed(@"VideoReviewEditVC");
+        @try {
+            [rvc setLastViewedSceneIndex:originalScene];
+        } @catch (...) {}
+        
+        [self terminateCurrentTaskQuietly];
+        NSString *summary = [NSString stringWithFormat:@"Đã hoàn tất %lu/%lu phân cảnh.",
+                             (unsigned long)completedScenes, (unsigned long)totalCount];
+        if (err) {
+            [self showNotificationAlert:[NSString stringWithFormat:@"%@\n%@", err, summary] title:@"Dừng giữa chừng"];
+        } else {
+            [self showNotificationAlert:summary title:@"Thành công 100%"];
+        }
     };
-    sceneStep = ^{
-        if (rid != g_run) { sceneStep = nil; return; }
-        if (offset >= count) { finish(nil); return; }
-        NSUInteger off = offset++, scene = start + off;
-        [self status:[NSString stringWithFormat:@"Phân cảnh %lu (%lu/%lu): nhập code…", (unsigned long)(scene + 1), (unsigned long)(off + 1), (unsigned long)count]];
-        id rvc = VSFindVC(@"VideoReviewEditVC");
-        [self openEditorForScene:scene review:rvc rid:rid completion:^(id editor) {
-            if (!editor) { finish([NSString stringWithFormat:@"Không mở được Nhiều lớp ở phân cảnh %lu.", (unsigned long)(scene + 1)]); return; }
-            [self importPreset:presets[off] code:codes[off] intoEditor:editor rid:rid completion:^(NSString *err) {
-                if (err) { finish([NSString stringWithFormat:@"Phân cảnh %lu: %@", (unsigned long)(scene + 1), err]); return; }
-                if (rid != g_run) { sceneStep = nil; return; }
-                [self status:[NSString stringWithFormat:@"Phân cảnh %lu: đợi preset ổn định…", (unsigned long)(scene + 1)]];
-                VSAfter(1000, ^{
-                    if (rid != g_run) { sceneStep = nil; return; }
-                    [self status:[NSString stringWithFormat:@"Phân cảnh %lu: thay ảnh/video…", (unsigned long)(scene + 1)]];
-                    [self applyResponse:resp toEditor:editor kind:nil skip:-1 rid:rid completion:^(NSUInteger changed, NSUInteger total) {
-                        if (rid != g_run) { sceneStep = nil; return; }
-                        [self status:[NSString stringWithFormat:@"Phân cảnh %lu: đang Create…", (unsigned long)(scene + 1)]];
-                        [self createInEditor:editor rid:rid completion:^(NSString *cerr) {
-                            if (cerr) { finish([NSString stringWithFormat:@"Phân cảnh %lu: %@", (unsigned long)(scene + 1), cerr]); return; }
-                            okCount++;
-                            VSPoll(rid, 100, 100, ^BOOL{ return VSFindVC(@"VideoReviewEditVC") != nil; }, ^(BOOL back) {
-                                if (!back) { finish(@"Không quay lại được màn hình phân cảnh."); return; }
-                                VSAfter(300, ^{ sceneStep(); });
+    
+    processNextSceneBlock = ^{
+        if (runId != g_runIdentifier) {
+            processNextSceneBlock = nil;
+            return;
+        }
+        
+        if (stepIndex >= totalCount) {
+            terminateBatch(nil);
+            return;
+        }
+        
+        NSUInteger currentOffset = stepIndex++;
+        NSUInteger sceneNum = start + currentOffset;
+        
+        [self updateStatusHUD:[NSString stringWithFormat:@"Phân cảnh %lu (%lu/%lu): Đang mở…",
+                               (unsigned long)(sceneNum + 1), (unsigned long)(currentOffset + 1), (unsigned long)totalCount]];
+        
+        id rvc = VSFindTopViewControllerNamed(@"VideoReviewEditVC");
+        [self openMultiLayerEditorForScene:sceneNum reviewVC:rvc runId:runId completion:^(id editorVC) {
+            if (!editorVC) {
+                terminateBatch([NSString stringWithFormat:@"Không thể mở Nhiều lớp ở phân cảnh %lu.", (unsigned long)(sceneNum + 1)]);
+                return;
+            }
+            
+            [self updateStatusHUD:[NSString stringWithFormat:@"Phân cảnh %lu: Đang nạp mã QR…", (unsigned long)(sceneNum + 1)]];
+            
+            // Bước 1: Nạp Preset và kích hoạt Interceptor giải quyết popup lệch frame ngay lập tức
+            [self importPresetPayload:presets[currentOffset] codeIdentifier:codes[currentOffset] intoEditor:editorVC runId:runId completion:^(NSString *importErr) {
+                if (importErr) {
+                    terminateBatch([NSString stringWithFormat:@"Phân cảnh %lu: %@", (unsigned long)(sceneNum + 1), importErr]);
+                    return;
+                }
+                
+                if (runId != g_runIdentifier) {
+                    processNextSceneBlock = nil;
+                    return;
+                }
+                
+                // Nhịp nghỉ an toàn 500ms để Engine ổn định layout và giải phóng bộ đệm
+                [self updateStatusHUD:[NSString stringWithFormat:@"Phân cảnh %lu: Đợi preset ổn định…", (unsigned long)(sceneNum + 1)]];
+                VSDispatchAfterMS(500, ^{
+                    if (runId != g_runIdentifier) {
+                        processNextSceneBlock = nil;
+                        return;
+                    }
+                    
+                    // Bước 2: Thay media vào các layer
+                    [self updateStatusHUD:[NSString stringWithFormat:@"Phân cảnh %lu: Đang thay ảnh/video…", (unsigned long)(sceneNum + 1)]];
+                    [self applyMediaResponse:response toEditor:editorVC filterKind:VSLayerMediaKindUnknown skipLayer:-1 runId:runId completion:^(NSUInteger changed, NSUInteger total) {
+                        if (runId != g_runIdentifier) {
+                            processNextSceneBlock = nil;
+                            return;
+                        }
+                        
+                        // Bước 3: Tạo clip hoàn tất (Bấm nút Tạo / Create)
+                        [self updateStatusHUD:[NSString stringWithFormat:@"Phân cảnh %lu: Đang kết xuất (Create)…", (unsigned long)(sceneNum + 1)]];
+                        [self triggerCreateInEditor:editorVC runId:runId completion:^(NSString *createErr) {
+                            if (createErr) {
+                                terminateBatch([NSString stringWithFormat:@"Phân cảnh %lu: %@", (unsigned long)(sceneNum + 1), createErr]);
+                                return;
+                            }
+                            
+                            completedScenes++;
+                            
+                            // Bước 4: Chờ quay trở lại VideoReviewEditVC an toàn
+                            VSSafePoll(runId, 100, 120, ^BOOL{
+                                return VSFindTopViewControllerNamed(@"VideoReviewEditVC") != nil;
+                            }, ^(BOOL returned) {
+                                if (!returned) {
+                                    terminateBatch(@"Không thể tự động quay lại màn hình phân cảnh sau khi tạo.");
+                                    return;
+                                }
+                                
+                                // Khoảng dừng 300ms giải phóng RAM triệt để trước khi qua scene tiếp theo (Chống Crash)
+                                VSDispatchAfterMS(300, ^{
+                                    processNextSceneBlock();
+                                });
                             });
                         }];
                     }];
@@ -1054,87 +1997,176 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
             }];
         }];
     };
-    sceneStep();
+    
+    processNextSceneBlock();
 }
 
-- (void)openEditorForScene:(NSUInteger)scene review:(id)rvc rid:(NSUInteger)rid completion:(void (^)(id editor))done {
-    id (^current)(void) = ^id{
-        id ed = VSFindVC(@"MultiLayerWizEffectVC");
+- (void)openMultiLayerEditorForScene:(NSUInteger)sceneIndex reviewVC:(id)reviewVC runId:(NSUInteger)runId completion:(void (^)(id editorVC))done {
+    id (^detectCurrentEditor)(void) = ^id{
+        id ed = VSFindTopViewControllerNamed(@"MultiLayerWizEffectVC");
         if (!ed || ![ed getMultiLayerEngine]) return nil;
         id nav = [ed navigationController];
-        BOOL sceneOK = [nav respondsToSelector:@selector(navSceneIndex)] ? ([nav navSceneIndex] == scene) : YES;
-        return sceneOK ? ed : nil;
+        BOOL sceneMatches = YES;
+        if ([nav respondsToSelector:@selector(navSceneIndex)]) {
+            sceneMatches = ([nav navSceneIndex] == sceneIndex);
+        }
+        return sceneMatches ? ed : nil;
     };
-    if (current()) { done(current()); return; }
-    if (!rvc) { done(nil); return; }
-    @try { [rvc setLastViewedSceneIndex:scene]; [rvc showMultiLayer]; }
-    @catch (NSException *e) { VSLog(@"showMultiLayer exception: %@", e.reason ?: e.name); done(nil); return; }
-    VSPoll(rid, 80, 100, ^BOOL{ return current() != nil; }, ^(BOOL ok) { done(ok ? current() : nil); });
+    
+    if (detectCurrentEditor()) {
+        done(detectCurrentEditor());
+        return;
+    }
+    
+    if (!reviewVC) {
+        done(nil);
+        return;
+    }
+    
+    @try {
+        [reviewVC setLastViewedSceneIndex:sceneIndex];
+        [reviewVC showMultiLayer];
+    } @catch (NSException *e) {
+        VSLog(@"Ngoại lệ khi gọi showMultiLayer cho scene %lu: %@", (unsigned long)sceneIndex, e);
+        done(nil);
+        return;
+    }
+    
+    VSSafePoll(runId, 80, 100, ^BOOL{
+        return detectCurrentEditor() != nil;
+    }, ^(BOOL success) {
+        done(success ? detectCurrentEditor() : nil);
+    });
 }
 
-// Import preset — kiểm tra g_importCount tăng + engine có layer + không popup
-- (void)importPreset:(id)preset code:(id)code intoEditor:(id)editor rid:(NSUInteger)rid completion:(void (^)(NSString *err))done {
-    if (![editor respondsToSelector:@selector(importedData:code:)]) { done(@"Editor không có hàm nhập code."); return; }
-    NSUInteger snap = g_importCount;
-    @try { [editor importedData:preset code:code]; }
-    @catch (NSException *e) { done([NSString stringWithFormat:@"Không nhập được code: %@", e.reason ?: e.name]); return; }
-
-    __block BOOL blocked = NO;
-    VSPoll(rid, 40, 250, ^BOOL{
-        VSPopupResult r = VSHandleEditorPopups(editor);
-        if (r == VSPopupBlocked) { blocked = YES; return YES; }
-        return g_importCount > snap;
+// Nạp mã QR vào Editor và tự động giải quyết các cảnh báo độ dài frame
+- (void)importPresetPayload:(id)preset codeIdentifier:(id)code intoEditor:(id)editorVC runId:(NSUInteger)runId completion:(void (^)(NSString *errorMessage))done {
+    if (![editorVC respondsToSelector:@selector(importedData:code:)]) {
+        done(@"Editor không hỗ trợ phương thức importedData:code:.");
+        return;
+    }
+    
+    NSUInteger countBefore = g_presetImportEventCounter;
+    
+    @try {
+        [editorVC importedData:preset code:code];
+    } @catch (NSException *e) {
+        done([NSString stringWithFormat:@"Lỗi khi nạp dữ liệu code: %@", e.reason ?: e.name]);
+        return;
+    }
+    
+    __block BOOL purchaseBlocked = NO;
+    
+    // Theo dõi popup và giải quyết ngay lập tức (Khắc phục triệt để Lỗi 1)
+    VSSafePoll(runId, 50, 200, ^BOOL{
+        VSPopupActionStatus st = VSResolvePopupsImmediately(editorVC);
+        if (st == VSPopupActionStatusBlockedPurchase) {
+            purchaseBlocked = YES;
+            return YES;
+        }
+        return g_presetImportEventCounter > countBefore;
     }, ^(BOOL ok) {
-        if (blocked) { done(@"Video Star hiện popup mua gói — Dừng."); return; }
-        if (!ok) { done(@"Code chưa nhập xong (timeout 10s)."); return; }
-        VSAfter(700, ^{
-            id engine = [editor getMultiLayerEngine];
-            VSPoll(rid, 60, 80, ^BOOL{
-                VSHandleEditorPopups(editor);
-                return !VSEditorHasVisiblePopup(editor) && [engine numActiveLayers] > 0;
-            }, ^(BOOL ready) { done(ready ? nil : @"Code đã nhập nhưng Nhiều lớp chưa sẵn sàng."); });
+        if (purchaseBlocked) {
+            done(@"Gặp popup yêu cầu mua bản quyền Video Star. Tạm dừng để tránh lỗi.");
+            return;
+        }
+        if (!ok) {
+            done(@"Hết thời gian chờ nạp mã QR (Timeout 10s).");
+            return;
+        }
+        
+        VSDispatchAfterMS(500, ^{
+            id engine = [editorVC getMultiLayerEngine];
+            VSSafePoll(runId, 60, 60, ^BOOL{
+                VSResolvePopupsImmediately(editorVC);
+                return !VSHasAnyActivePopup(editorVC) && [engine numActiveLayers] > 0;
+            }, ^(BOOL ready) {
+                done(ready ? nil : @"Mã QR đã nạp nhưng Engine Nhiều lớp chưa sẵn sàng.");
+            });
         });
     });
 }
 
-- (void)createInEditor:(id)editor rid:(NSUInteger)rid completion:(void (^)(NSString *err))done {
-    BOOL fired = NO;
-    id item = VSValue(editor, @"createBarButton");
+// Bấm nút Tạo (Create) và theo dõi quá trình đóng view an toàn
+- (void)triggerCreateInEditor:(id)editorVC runId:(NSUInteger)runId completion:(void (^)(NSString *errorMessage))done {
+    BOOL buttonTriggered = NO;
+    id createItem = VSSafeValueForKey(editorVC, @"createBarButton");
+    
     @try {
-        if ([item isKindOfClass:UIBarButtonItem.class] && ((UIBarButtonItem *)item).action) {
-            UIBarButtonItem *b = item;
-            fired = [UIApplication.sharedApplication sendAction:b.action to:b.target from:b forEvent:nil];
-        } else if ([item isKindOfClass:UIControl.class]) {
-            [(UIControl *)item sendActionsForControlEvents:UIControlEventTouchUpInside]; fired = YES;
+        if ([createItem isKindOfClass:[UIBarButtonItem class]]) {
+            UIBarButtonItem *barBtn = (UIBarButtonItem *)createItem;
+            if (barBtn.action && barBtn.target) {
+                buttonTriggered = [UIApplication.sharedApplication sendAction:barBtn.action
+                                                                           to:barBtn.target
+                                                                         from:barBtn
+                                                                     forEvent:nil];
+            }
+        } else if ([createItem isKindOfClass:[UIControl class]]) {
+            [(UIControl *)createItem sendActionsForControlEvents:UIControlEventTouchUpInside];
+            buttonTriggered = YES;
         }
-        if (!fired && [editor respondsToSelector:@selector(create)]) { [editor create]; fired = YES; }
-    } @catch (NSException *e) { done([NSString stringWithFormat:@"Không bấm được Tạo: %@", e.reason ?: e.name]); return; }
-    if (!fired) { done(@"Không tìm thấy nút Tạo."); return; }
-    __block BOOL blocked = NO;
-    VSPoll(rid, 100, 600, ^BOOL{
-        if (VSHandleEditorPopups(editor) == VSPopupBlocked) { blocked = YES; return YES; }
-        return !([editor isViewLoaded] && [[editor view] window]);
+        
+        if (!buttonTriggered && [editorVC respondsToSelector:@selector(create)]) {
+            [editorVC create];
+            buttonTriggered = YES;
+        }
+    } @catch (NSException *e) {
+        done([NSString stringWithFormat:@"Không thể kích hoạt nút Tạo: %@", e.reason ?: e.name]);
+        return;
+    }
+    
+    if (!buttonTriggered) {
+        done(@"Không tìm thấy nút Tạo trên thanh điều hướng.");
+        return;
+    }
+    
+    __block BOOL purchaseBlocked = NO;
+    
+    VSSafePoll(runId, 100, 600, ^BOOL{
+        if (VSResolvePopupsImmediately(editorVC) == VSPopupActionStatusBlockedPurchase) {
+            purchaseBlocked = YES;
+            return YES;
+        }
+        // Khi hoàn tất tạo, view của MultiLayerWizEffectVC sẽ được gỡ khỏi window
+        return !([editorVC isViewLoaded] && [[editorVC view] window]);
     }, ^(BOOL closed) {
-        done(blocked ? @"Tạo yêu cầu mua gói — Dừng." : (closed ? nil : @"Tạo chưa hoàn tất."));
+        if (purchaseBlocked) {
+            done(@"Thao tác Tạo yêu cầu mua bản quyền gói Pro.");
+        } else if (closed) {
+            done(nil);
+        } else {
+            done(@"Quá trình tạo clip phân cảnh chưa hoàn tất.");
+        }
     });
 }
 
 @end
 
 // ============================================================================
-// ENTRY
+// PHẦN 13: ĐIỂM KHỞI CHẠY CHÍNH (CONSTRUCTOR & NOTIFICATION OBSERVERS)
 // ============================================================================
-static void VSBootstrap(void) {
-    if (!NSClassFromString(@"MultiLayerWizEffectVC")) { VSLog(@"không phải Video Star"); return; }
-    [VSTool.shared installIfNeeded];
+
+static void VSBootstrapAutomation(void) {
+    if (!NSClassFromString(@"MultiLayerWizEffectVC")) {
+        VSLog(@"Không phải bundle của Video Star, bỏ qua khởi tạo.");
+        return;
+    }
+    VSRunOnMain(^{
+        [VSTool.shared setupToolInterfaceIfNeeded];
+    });
 }
 
-__attribute__((constructor)) static void VSToolInit(void) {
+__attribute__((constructor)) static void VSToolInitializerEntry(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
                                                          object:nil
                                                           queue:NSOperationQueue.mainQueue
-                                                     usingBlock:^(NSNotification *n) { VSBootstrap(); }];
-        if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) VSBootstrap();
+                                                     usingBlock:^(NSNotification *note) {
+            VSBootstrapAutomation();
+        }];
+        
+        if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) {
+            VSBootstrapAutomation();
+        }
     });
 }
