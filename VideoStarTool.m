@@ -10,8 +10,14 @@
 //
 // ĐẶC TRỊ TRIỆT ĐỂ 3 NGUYÊN NHÂN LỖI TRÊN VIDEO:
 //   - LỖI 1: Popup cảnh báo lệch frame (Mismatch Frame/Duration Warning)
+//            -> Interceptor tự động chọn "Trùng khớp" / "Khớp: rút ngắn/giãn"
+//               ngay khi popup vừa khởi tạo, không làm đọng UI.
 //   - LỖI 2: Kẹt vòng lặp chờ trạng thái (Stuck/Infinite Polishing State)
+//            -> State-machine có Watchdog Timeout độc lập cho từng layer & scene,
+//               xác nhận đa tiêu chí (asset, textureID, info) không phụ thuộc con trỏ.
 //   - LỖI 3: Tràn RAM / Xung đột luồng đồ họa gây sập app (Crash / Black Screen)
+//            -> Bao bọc @autoreleasepool triệt để từng tick, điều tiết nhịp thở
+//               (cadence throttle) tránh nghẽn Main RunLoop và OpenGL/Metal Context.
 // ============================================================================
 
 #import <UIKit/UIKit.h>
@@ -173,6 +179,19 @@ static inline CMTime VSSafeCurrentTime(id object) {
     } @catch (NSException *e) {
         VSLog(@"Lỗi lấy currentTime: %@", e);
         return kCMTimeInvalid;
+    }
+}
+
+// Helper set delegate an toàn — tránh xung đột selector setDelegate: với NSFileManager
+// (compiler không phân biệt được id<QRCodeManagerDelegate> vs id<NSFileManagerDelegate>)
+static inline void VSSetQRDelegateSafely(id qrManager, id delegate) {
+    if (!qrManager) return;
+    SEL sel = @selector(setDelegate:);
+    if (![qrManager respondsToSelector:sel]) return;
+    @try {
+        ((void (*)(id, SEL, id))[qrManager methodForSelector:sel])(qrManager, sel, delegate);
+    } @catch (NSException *e) {
+        VSLog(@"setQRDelegate exception: %@", e);
     }
 }
 
@@ -1203,8 +1222,8 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
     if (!self.savedOriginalQRDelegateValid) return;
     Class qc = NSClassFromString(@"QRCodeManager");
     id qr = [qc respondsToSelector:@selector(sharedInstance)] ? [qc sharedInstance] : nil;
-    if (qr && [qr respondsToSelector:@selector(setDelegate:)]) {
-        [qr setDelegate:self.savedOriginalQRDelegate];
+    if (qr) {
+        VSSetQRDelegateSafely(qr, self.savedOriginalQRDelegate);
     }
     self.savedOriginalQRDelegate = nil;
     self.savedOriginalQRDelegateValid = NO;
@@ -1827,7 +1846,7 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
     }
     
     @try {
-        [qr setDelegate:proxy];
+        VSSetQRDelegateSafely(qr, proxy);
         self.multiSceneCardView.hidden = YES;
         [qr startQRImport];
     } @catch (NSException *e) {
