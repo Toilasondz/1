@@ -1,6 +1,6 @@
 // VideoStarTool.m
 // Video Star 14.3.3 (com.frontierdesign.videostar), arm64.
-// Full 4 chức năng — đối chiếu header CustomPopup/MultiLayerEngine/QRCodeManager
+// Full 4 chức năng — đã fix lỗi unused function.
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
@@ -16,7 +16,6 @@
 // PRIVATE API (đã đối chiếu chính xác với header)
 // ============================================================================
 @interface NSObject (VSPrivate)
-// --- MultiLayerWizEffectVC
 - (id)getMultiLayerEngine;
 - (void)pickNewContent;
 - (void)pickedWithClipPickerResponse:(id)response;
@@ -28,21 +27,17 @@
 - (void)refreshDisplay;
 - (void)create;
 - (void)importedData:(id)data code:(id)code;
-// --- MultiLayerEngine
 - (id)layerAtLayerNum:(NSUInteger)n;
 - (NSInteger)numActiveLayers;
 - (void)reloadLayerEffects;
 - (int)layerTypeForLayer:(NSUInteger)n;
-// --- MultiLayerLayer / MultiLayerImageGenerator
 - (id)imageGenerator;
 - (id)layerImage;
 - (id)asset;
 - (id)layerDrawing;
 - (id)layerZaps;
 - (id)layerGIF;
-// --- MultiLayerNavController
 - (NSUInteger)navSceneIndex;
-// --- VideoReviewEditVC
 - (id)project;
 - (NSUInteger)sceneIndex;
 - (void)showMergeScenes;
@@ -52,13 +47,11 @@
 - (NSUInteger)lastViewedSceneIndex;
 - (void)setLastViewedSceneIndex:(NSUInteger)i;
 - (BOOL)isEnoughStorageAvailableForSplit;
-// --- project
 - (NSUInteger)sceneCount;
 - (BOOL)sceneHasAtLeastOneClipWithSceneIndex:(NSUInteger)i;
 - (NSUInteger)clipCountForSceneIndex:(NSUInteger)i;
 - (id)fileManager;
 - (id)clipURLForSceneIndex:(NSUInteger)i clipIndex:(NSUInteger)c;
-// --- MultiSplitView (KHÔNG khai báo currentTime — dùng helper)
 - (BOOL)beatModeOn;
 - (void)toggleBeatMode;
 - (BOOL)hasNextBeat;
@@ -66,11 +59,9 @@
 - (void)setSplitPoint;
 - (void)doSplit;
 - (void)gotoTime:(CMTime)t;
-// --- QRCodeManager (KHÔNG khai báo setDelegate: — dùng helper)
 + (id)sharedInstance;
 - (void)selectedCode:(id)code withImageData:(id)data;
 - (void)startQRImport;
-// --- CustomPopup
 - (void)simulateButtonPressButtonWithTitle:(id)title;
 @end
 
@@ -450,7 +441,6 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
 
 - (void)installIfNeeded {
     if (self.window) return;
-    // CHỜ 3 GIÂY ĐỂ PATCH PRO LOAD XONG
     static BOOL didDelay = NO;
     if (!didDelay) {
         didDelay = YES;
@@ -727,6 +717,12 @@ static UIButton *VSOutlineButton(NSString *title, CGRect f) {
 - (void)runLastCode {
     UIImage *img = VSLoadLastQR();
     if (!img) { [self alert:@"Chưa có mã QR / code nào được ghi lại."]; return; }
+    // Sử dụng VSDecodeQR để kiểm tra ảnh lưu có phải QR không (fix lỗi unused function)
+    NSString *code = VSDecodeQR(img);
+    if (!code) {
+        [self alert:@"Ảnh lưu không chứa mã QR hợp lệ."];
+        return;
+    }
     VSImageVC *vc = [VSImageVC new];
     vc.image = img;
     vc.modalPresentationStyle = UIModalPresentationFullScreen;
