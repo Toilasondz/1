@@ -101,6 +101,7 @@
 
 static NSUInteger g_runIdentifier = 0;
 static BOOL g_autoConfirmPopups = NO;            // CHỈ bật trong Chức năng 4
+static BOOL g_suppressLayerActionMenu = NO;      // chặn menu "Biên tập / Thay Nội dung / Xoá" khi tool đang chạy
 static NSHashTable *g_activePopupsTable = nil;
 static __weak id g_lastHandledPopup = nil;
 static CFAbsoluteTime g_lastHandledPopupTime = 0;
@@ -329,6 +330,73 @@ static BOOL VSTitleMatches(NSString *title, NSString *candidate) {
     return VSContains(trimmed, candidate);
 }
 
+
+// Lấy danh sách nút của CustomPopup (từ _buttonStrings và _buttons).
+static NSArray<NSString *> *VSPopupButtonTitles(id popup, NSDictionary<NSString *, UIButton *> **buttonMap) {
+    NSMutableArray<NSString *> *titles = [NSMutableArray array];
+    NSMutableDictionary<NSString *, UIButton *> *map = [NSMutableDictionary dictionary];
+    id strings = VSSafeValueForKey(popup, @"_buttonStrings");
+    if ([strings isKindOfClass:[NSArray class]])
+        for (id t in (NSArray *)strings) if ([t isKindOfClass:[NSString class]] && [(NSString *)t length]) [titles addObject:t];
+    id buttons = VSSafeValueForKey(popup, @"_buttons");
+    if ([buttons isKindOfClass:[NSArray class]]) {
+        for (id b in (NSArray *)buttons) {
+            if (![b isKindOfClass:[UIButton class]]) continue;
+            NSString *t = ((UIButton *)b).currentTitle;
+            if (!t.length) continue;
+            map[t] = (UIButton *)b;
+            if (![titles containsObject:t]) [titles addObject:t];
+        }
+    }
+    if (buttonMap) *buttonMap = map;
+    return titles;
+}
+
+// Menu chọn lớp của Video Star: Biên tập Khung hình chính / Thêm Mặt nạ / Sửa tiêu đề / Thay Nội dung / Hủy kích hoạt / Xoá.
+// Menu này KHÔNG phải popup cần xác nhận: không bấm, không chờ — chỉ đóng.
+static BOOL VSPopupIsLayerActionMenu(id popup) {
+    NSArray<NSString *> *titles = VSPopupButtonTitles(popup, NULL);
+    if (titles.count < 3) return NO;
+    NSArray *known = @[@"Edit Keyframes", @"Biên tập Khung hình chính",
+                       @"Add Mask", @"Thêm Mặt nạ",
+                       @"Edit Title", @"Sửa tiêu đề",
+                       @"Replace Content", @"Thay Nội dung",
+                       @"Deactivate", @"Activate", @"Hủy kích hoạt", @"Kích hoạt",
+                       @"Delete", @"Xoá", @"Xóa"];
+    NSUInteger hits = 0;
+    for (NSString *t in titles) {
+        for (NSString *k in known) {
+            if (VSTitleMatches(t, k)) { hits++; break; }
+        }
+    }
+    return hits >= 3;
+}
+
+static void VSDismissLayerActionMenus(id editorVC) {
+    if (!g_suppressLayerActionMenu) return;
+    for (id popup in VSCollectAllVisiblePopups(editorVC)) {
+        if (!VSPopupIsLayerActionMenu(popup)) continue;
+        VSTry(^{
+            if ([popup respondsToSelector:@selector(dismiss)]) { VSLog(@"[LayerMenu] đóng menu chọn lớp"); [popup dismiss]; }
+        });
+    }
+}
+
+// Editor đang bận tải asset (spinner / loadingAlert).
+static BOOL VSEditorIsBusy(id editorVC) {
+    id spinner = VSSafeValueForKey(editorVC, @"spinner");
+    if ([spinner isKindOfClass:[UIActivityIndicatorView class]]) {
+        UIActivityIndicatorView *sp = (UIActivityIndicatorView *)spinner;
+        if (sp.isAnimating && sp.window && !sp.hidden) return YES;
+    }
+    id alert = VSSafeValueForKey(editorVC, @"loadingAlert");
+    if ([alert isKindOfClass:[UIView class]]) {
+        UIView *v = (UIView *)alert;
+        if (v.window && !v.hidden && v.alpha > 0.01) return YES;
+    }
+    return NO;
+}
+
 static VSPopupActionStatus VSResolvePopupsImmediately(id editorVC) {
     if (!g_autoConfirmPopups) return VSPopupActionStatusNone;
     NSArray *popups = VSCollectAllVisiblePopups(editorVC);
@@ -346,24 +414,12 @@ static VSPopupActionStatus VSResolvePopupsImmediately(id editorVC) {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
 
     for (id popup in popups) {
+        if (VSPopupIsLayerActionMenu(popup)) continue;   // không bao giờ bấm nút trong menu chọn lớp
         if (VSCheckIfPopupIsPurchasePrompt(popup)) { VSLog(@"Popup mua Pro — dừng"); return VSPopupActionStatusBlockedPurchase; }
         if (popup == g_lastHandledPopup && (now - g_lastHandledPopupTime < 0.35)) return VSPopupActionStatusHandled;
 
-        NSMutableArray<NSString *> *titles = [NSMutableArray array];
-        NSMutableDictionary<NSString *, UIButton *> *buttonByTitle = [NSMutableDictionary dictionary];
-        id strings = VSSafeValueForKey(popup, @"_buttonStrings");
-        if ([strings isKindOfClass:[NSArray class]])
-            for (id t in (NSArray *)strings) if ([t isKindOfClass:[NSString class]] && [(NSString *)t length]) [titles addObject:t];
-        id buttons = VSSafeValueForKey(popup, @"_buttons");
-        if ([buttons isKindOfClass:[NSArray class]]) {
-            for (id b in (NSArray *)buttons) {
-                if (![b isKindOfClass:[UIButton class]]) continue;
-                NSString *t = ((UIButton *)b).currentTitle;
-                if (!t.length) continue;
-                buttonByTitle[t] = (UIButton *)b;
-                if (![titles containsObject:t]) [titles addObject:t];
-            }
-        }
+        NSDictionary<NSString *, UIButton *> *buttonByTitle = nil;
+        NSArray<NSString *> *titles = VSPopupButtonTitles(popup, &buttonByTitle);
         if (titles.count == 0) continue;
 
         NSString *matchedTitle = nil;
@@ -392,8 +448,10 @@ static VSPopupActionStatus VSResolvePopupsImmediately(id editorVC) {
     return VSPopupActionStatusNone;
 }
 
-static inline BOOL VSHasAnyActivePopup(id editorVC) {
-    return VSCollectAllVisiblePopups(editorVC).count > 0;
+static BOOL VSHasAnyActivePopup(id editorVC) {
+    for (id popup in VSCollectAllVisiblePopups(editorVC))
+        if (!VSPopupIsLayerActionMenu(popup)) return YES;
+    return NO;
 }
 
 // ============================================================================
@@ -436,9 +494,9 @@ static VSLayerSnapshot *VSInspectLayerDetails(id engine, NSUInteger layerNum) {
             snap.mediaKind = VSLayerMediaKindOther;
             snap.assetInfo = [VSSafeValueForKey(layer, @"origAssetInfo") description] ?: @"";
 
-            if (VSValueIsTruthy(VSSafeValueForKey(layer, @"layer3D")) ||
-                VSValueIsTruthy(VSSafeValueForKey(layer, @"layer3d"))) {
-                snap.signature = @"3d"; return snap;
+            // Lớp null / lớp cha (parent) không phải media.
+            if (VSValueIsTruthy(VSSafeValueForKey(layer, @"isNullLayer"))) {
+                snap.signature = @"null"; return snap;
             }
 
             id generator = VSSafeValueForKey(layer, @"imageGenerator");
@@ -454,11 +512,6 @@ static VSLayerSnapshot *VSInspectLayerDetails(id engine, NSUInteger layerNum) {
                     snap.signature = key; return snap;
                 }
             }
-            for (NSString *key in @[@"isTextLayer", @"isColorLayer", @"is3DLayer"]) {
-                if (VSValueIsTruthy(VSSafeValueForKey(generator, key))) {
-                    snap.signature = key; return snap;
-                }
-            }
 
             id asset = VSSafeValueForKey(generator, @"asset");
             BOOL hasVideo = [asset isKindOfClass:[AVAsset class]];
@@ -468,6 +521,12 @@ static VSLayerSnapshot *VSInspectLayerDetails(id engine, NSUInteger layerNum) {
 
             id tex = VSSafeValueForKey(generator, @"layerImageTextureID");
             snap.textureID = [tex isKindOfClass:[NSNumber class]] ? [(NSNumber *)tex unsignedIntValue] : 0;
+
+            // Lớp văn bản / hạt: có layerImage nhưng không phải ảnh. Video luôn thắng (tránh textDictionary cũ còn sót).
+            if (!hasVideo && (VSValueIsTruthy(VSSafeValueForKey(layer, @"textDictionary")) ||
+                              VSValueIsTruthy(VSSafeValueForKey(layer, @"particleLabModel")))) {
+                snap.signature = @"text_or_particle"; return snap;
+            }
 
             NSString *assetKey = @"";
             if ([asset isKindOfClass:[AVURLAsset class]]) assetKey = ((AVURLAsset *)asset).URL.absoluteString ?: @"";
@@ -515,12 +574,20 @@ static VSLayerSnapshot *VSFirstReplaceableLayer(id engine) {
 }
 
 static void VSSelectLayerOnEditor(id editorVC, NSUInteger n, NSUInteger runId, void (^done)(BOOL selected)) {
-    VSTry(^{ if ([editorVC respondsToSelector:@selector(selectLayer:bordered:)]) [editorVC selectLayer:n bordered:NO]; });
     BOOL (^isSelected)(void) = ^BOOL{ return [editorVC lastSelectedLayerNum] == (NSInteger)n; };
+    BOOL already = NO;
+    @try { already = isSelected(); } @catch (...) {}
+    // Lớp đang được chọn sẵn: KHÔNG gọi select lại (gọi lại sẽ bật menu Biên tập / Thay Nội dung / Xoá).
+    if (already) { VSDismissLayerActionMenus(editorVC); done(YES); return; }
+
+    VSTry(^{ if ([editorVC respondsToSelector:@selector(selectLayer:bordered:)]) [editorVC selectLayer:n bordered:NO]; });
     VSSafePoll(runId, 50, 20, isSelected, ^(BOOL sel) {
-        if (sel) { done(YES); return; }
+        if (sel) { VSDismissLayerActionMenus(editorVC); done(YES); return; }
         VSTry(^{ if ([editorVC respondsToSelector:@selector(selectLayerNum:flash:)]) [editorVC selectLayerNum:n flash:NO]; });
-        VSSafePoll(runId, 50, 12, isSelected, ^(BOOL sel2) { done(sel2); });
+        VSSafePoll(runId, 50, 12, isSelected, ^(BOOL sel2) {
+            VSDismissLayerActionMenus(editorVC);
+            done(sel2);
+        });
     });
 }
 
@@ -586,7 +653,8 @@ static IMP g_origPickedWithResponse = NULL;
 static IMP g_origSelectedCodeWithImageData = NULL;
 static IMP g_origImportNewPreset = NULL;
 static IMP g_origImportOldPreset = NULL;
-static IMP g_origCustomPopupShow = NULL;
+static IMP g_origCustomPopupDidMove = NULL;
+static IMP g_origShowLayerActionMenu = NULL;
 
 static NSUInteger g_presetImportEventCounter = 0;
 static void (^g_activeMediaPickedHandler)(id editorVC, id response) = nil;
@@ -636,13 +704,22 @@ static void VSInstallCoreHooksOnce(void) {
             g_presetImportEventCounter++;
         }, &g_origImportOldPreset);
 
-        // Popup chỉ được tự bấm khi Chức năng 4 đang chạy. CN1 và mọi lúc khác: để nguyên cho người dùng.
-        VSRobustSwizzleMethod(@"CustomPopup", @selector(show), ^(id selfInstance) {
-            if (g_origCustomPopupShow)
-                ((void (*)(id, SEL))g_origCustomPopupShow)(selfInstance, @selector(show));
-            if (selfInstance) [g_activePopupsTable addObject:selfInstance];
+        // Mọi CustomPopup (kể cả popup hiện bằng showFromRect / showNextToRect) đều được ghi nhận khi vào window.
+        // Chỉ tự bấm khi Chức năng 4 đang chạy; CN1 và lúc dùng bình thường để nguyên cho người dùng.
+        VSRobustSwizzleMethod(@"CustomPopup", @selector(didMoveToWindow), ^(id selfInstance) {
+            if (g_origCustomPopupDidMove)
+                ((void (*)(id, SEL))g_origCustomPopupDidMove)(selfInstance, @selector(didMoveToWindow));
+            if (![selfInstance isKindOfClass:[UIView class]] || !((UIView *)selfInstance).window) return;
+            [g_activePopupsTable addObject:selfInstance];
             if (g_autoConfirmPopups) VSDispatchAfterMS(80, ^{ VSResolvePopupsImmediately(nil); });
-        }, &g_origCustomPopupShow);
+        }, &g_origCustomPopupDidMove);
+
+        // Khi tool đang chạy: không cho app bật menu chọn lớp (nó chặn màn hình và làm vòng lặp thay media bị kẹt).
+        VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(showLayerActionMenu:newLayer:), ^(id selfInstance, NSUInteger layerNum, BOOL isNewLayer) {
+            if (g_suppressLayerActionMenu) { VSLog(@"[LayerMenu] chặn showLayerActionMenu (lớp %lu)", (unsigned long)layerNum); return; }
+            if (g_origShowLayerActionMenu)
+                ((void (*)(id, SEL, NSUInteger, BOOL))g_origShowLayerActionMenu)(selfInstance, @selector(showLayerActionMenu:newLayer:), layerNum, isNewLayer);
+        }, &g_origShowLayerActionMenu);
 
         VSLog(@"Hooks installed");
     });
@@ -987,6 +1064,7 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 - (NSUInteger)startNewTaskWithDescription:(NSString *)name initialStatus:(NSString *)status {
     g_runIdentifier++;
     g_autoConfirmPopups = NO;
+    g_suppressLayerActionMenu = NO;
     self.currentTaskName = name;
     self.floatingButton.alpha = 0.55;
     [self updateStatusHUD:status];
@@ -1004,6 +1082,7 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 - (void)terminateCurrentTaskQuietly {
     g_runIdentifier++;
     g_autoConfirmPopups = NO;
+    g_suppressLayerActionMenu = NO;
     g_activeMediaPickedHandler = nil;
     [self restoreOriginalQRCodeDelegate];
     [self dismissBottomActionBar];
@@ -1072,89 +1151,117 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 // Thay media cho các lớp video/ảnh còn lại, chạy ngầm. Lớp rỗng / lớp khác không bao giờ bị đụng.
 // skipIndex: lớp đã được thay bằng bảng chọn (<0 = không bỏ qua lớp nào).
 - (void)applyMediaResponse:(id)response toEditor:(id)editorVC skipLayer:(NSInteger)skipIndex runId:(NSUInteger)runId completion:(void (^)(NSUInteger, NSUInteger, BOOL))done {
-    id engine = nil;
-    @try { engine = [editorVC getMultiLayerEngine]; } @catch (...) {}
-    if (!engine) { done(0, 0, NO); return; }
+    // 1) Đóng menu chọn lớp (nếu có) và chờ editor tải xong asset trước khi quét lớp.
+    __block NSUInteger idleChecks = 0;
+    VSSafePoll(runId, 100, 100, ^BOOL{
+        VSDismissLayerActionMenus(editorVC);
+        // Tối thiểu 2 lần kiểm tra liên tiếp thấy rảnh để tránh bắt nhầm khoảnh khắc giữa hai lần tải.
+        idleChecks = VSEditorIsBusy(editorVC) ? 0 : idleChecks + 1;
+        return idleChecks >= 2;
+    }, ^(BOOL idle) {
+        if (runId != g_runIdentifier) return;
 
-    NSMutableArray<NSNumber *> *targets = [NSMutableArray array];
-    for (VSLayerSnapshot *snap in VSScanLayers(engine)) {
-        if (!VSLayerKindIsReplaceable(snap.mediaKind)) continue;
-        if ((NSInteger)snap.layerIndex == skipIndex) continue;
-        [targets addObject:@(snap.layerIndex)];
-    }
-    NSUInteger total = targets.count;
-    if (total == 0) { done(0, 0, NO); return; }
+        id engine = nil;
+        @try { engine = [editorVC getMultiLayerEngine]; } @catch (...) {}
+        if (!engine) { done(0, 0, NO); return; }
 
-    __block NSUInteger idx = 0, changed = 0;
-    __block BOOL blockedPurchase = NO;
-    __block void (^iterate)(void) = nil;
+        // 2) Chỉ lấy lớp VIDEO / ẢNH có nội dung. Rỗng và các loại khác bị loại ngay tại đây.
+        NSMutableArray<NSNumber *> *targets = [NSMutableArray array];
+        for (VSLayerSnapshot *snap in VSScanLayers(engine)) {
+            if (!VSLayerKindIsReplaceable(snap.mediaKind)) continue;
+            if ((NSInteger)snap.layerIndex == skipIndex) continue;
+            [targets addObject:@(snap.layerIndex)];
+        }
+        NSUInteger total = targets.count;
+        if (total == 0) { done(0, 0, NO); return; }
 
-    BOOL (^cancelled)(void) = ^BOOL{
-        if (runId != g_runIdentifier) { iterate = nil; return YES; }
-        return NO;
-    };
-    void (^finishRun)(void) = ^{
-        iterate = nil;
-        if (changed > 0) VSRefreshEditorAfterReplace(editorVC, engine);
-        done(changed, total, blockedPurchase);
-    };
-    void (^next)(void) = ^{ VSDispatchAfterMS(30, ^{ if (iterate) iterate(); }); };
+        __block NSUInteger idx = 0, changed = 0;
+        __block BOOL blockedPurchase = NO;
+        __block void (^iterate)(void) = nil;
 
-    iterate = ^{
-        if (cancelled()) return;
-        if (idx >= total) { finishRun(); return; }
+        BOOL (^cancelled)(void) = ^BOOL{
+            if (runId != g_runIdentifier) { iterate = nil; return YES; }
+            return NO;
+        };
+        void (^finishRun)(void) = ^{
+            iterate = nil;
+            VSDismissLayerActionMenus(editorVC);
+            if (changed > 0) VSRefreshEditorAfterReplace(editorVC, engine);
+            done(changed, total, blockedPurchase);
+        };
+        void (^next)(void) = ^{ VSDispatchAfterMS(30, ^{ if (iterate) iterate(); }); };
 
-        // Chờ popup hiện có biến mất (CN1: người dùng tự bấm; CN4: tự bấm).
-        NSUInteger waitTries = g_autoConfirmPopups ? 150 : 1200;
-        VSSafePoll(runId, 100, waitTries, ^BOOL{
-            if (VSResolvePopupsImmediately(editorVC) == VSPopupActionStatusBlockedPurchase) { blockedPurchase = YES; return YES; }
-            return !VSHasAnyActivePopup(editorVC);
-        }, ^(BOOL clear) {
+        iterate = ^{
             if (cancelled()) return;
-            if (blockedPurchase || !clear) { finishRun(); return; }
+            if (idx >= total) { finishRun(); return; }
+            VSDismissLayerActionMenus(editorVC);
 
-            NSUInteger n = targets[idx++].unsignedIntegerValue;
-            [self updateStatusHUD:[NSString stringWithFormat:@"Đang thay: lớp %lu (%lu/%lu)", (unsigned long)(n + 1), (unsigned long)idx, (unsigned long)total]];
-
-            VSSelectLayerOnEditor(editorVC, n, runId, ^(BOOL selected) {
+            // Chờ popup thật còn hiện (CN1: người dùng tự bấm; CN4: tool tự bấm). Menu chọn lớp không tính.
+            NSUInteger waitTries = g_autoConfirmPopups ? 150 : 1200;
+            VSSafePoll(runId, 100, waitTries, ^BOOL{
+                if (VSResolvePopupsImmediately(editorVC) == VSPopupActionStatusBlockedPurchase) { blockedPurchase = YES; return YES; }
+                return !VSHasAnyActivePopup(editorVC);
+            }, ^(BOOL clear) {
                 if (cancelled()) return;
-                if (!selected) { VSLog(@"layer %lu: chọn lớp thất bại → bỏ qua", (unsigned long)n); next(); return; }
+                if (blockedPurchase || !clear) { finishRun(); return; }
 
-                VSDispatchAfterMS(50, ^{
+                NSUInteger n = targets[idx++].unsignedIntegerValue;
+                [self updateStatusHUD:[NSString stringWithFormat:@"Đang thay: lớp %lu (%lu/%lu)", (unsigned long)(n + 1), (unsigned long)idx, (unsigned long)total]];
+
+                VSSelectLayerOnEditor(editorVC, n, runId, ^(BOOL selected) {
                     if (cancelled()) return;
-                    VSLayerSnapshot *before = VSInspectLayerDetails(engine, n);
-                    if (!before || !VSLayerKindIsReplaceable(before.mediaKind)) {
-                        VSLog(@"layer %lu: không còn là video/ảnh → bỏ qua", (unsigned long)n);
-                        next(); return;
-                    }
-                    NSString *beforeSignature = before.signature ?: @"";
-                    if (!VSReplayClipPickerResponseOnEditor(editorVC, response)) {
-                        VSLog(@"layer %lu: replay fail", (unsigned long)n);
-                        next(); return;
-                    }
+                    if (!selected) { VSLog(@"layer %lu: chọn lớp thất bại → bỏ qua", (unsigned long)n); next(); return; }
 
-                    __block BOOL confirmed = NO, blocked = NO;
-                    __block CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 2.5;
-                    NSUInteger confirmTries = g_autoConfirmPopups ? 250 : 2000;
-                    VSSafePoll(runId, 80, confirmTries, ^BOOL{
-                        if (VSResolvePopupsImmediately(editorVC) == VSPopupActionStatusBlockedPurchase) { blocked = YES; return YES; }
-                        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-                        if (VSHasAnyActivePopup(editorVC)) { deadline = now + 2.5; return NO; }
-                        VSLayerSnapshot *cur = VSInspectLayerDetails(engine, n);
-                        if (cur && ![cur.signature ?: @"" isEqualToString:beforeSignature]) { confirmed = YES; return YES; }
-                        return now > deadline;
-                    }, ^(BOOL r) {
+                    VSDispatchAfterMS(40, ^{
                         if (cancelled()) return;
-                        if (blocked) { blockedPurchase = YES; finishRun(); return; }
-                        if (confirmed) changed++;
-                        VSLog(@"layer %lu: %@", (unsigned long)n, confirmed ? @"✅" : @"⚠️ chưa xác nhận");
-                        next();
+                        VSLayerSnapshot *before = VSInspectLayerDetails(engine, n);
+                        if (!before || !VSLayerKindIsReplaceable(before.mediaKind)) {
+                            VSLog(@"layer %lu: không còn là video/ảnh → bỏ qua", (unsigned long)n);
+                            next(); return;
+                        }
+                        NSString *beforeSignature = before.signature ?: @"";
+                        if (!VSReplayClipPickerResponseOnEditor(editorVC, response)) {
+                            VSLog(@"layer %lu: replay fail", (unsigned long)n);
+                            next(); return;
+                        }
+
+                        // 3) Xác nhận: media đổi -> chờ editor hết tải -> sang lớp kế. Menu chọn lớp bật lại thì đóng ngay.
+                        __block BOOL confirmed = NO, blocked = NO, changedSeen = NO;
+                        __block CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 8.0;
+                        __block CFAbsoluteTime idleDeadline = 0;
+                        NSUInteger confirmTries = g_autoConfirmPopups ? 500 : 2000;
+                        VSSafePoll(runId, 80, confirmTries, ^BOOL{
+                            VSDismissLayerActionMenus(editorVC);
+                            if (VSResolvePopupsImmediately(editorVC) == VSPopupActionStatusBlockedPurchase) { blocked = YES; return YES; }
+                            CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+                            if (VSHasAnyActivePopup(editorVC)) {
+                                deadline = MAX(deadline, now + 2.5);
+                                if (changedSeen) idleDeadline = MAX(idleDeadline, now + 4.0);
+                                return NO;
+                            }
+                            if (!changedSeen) {
+                                VSLayerSnapshot *cur = VSInspectLayerDetails(engine, n);
+                                if (cur && ![cur.signature ?: @"" isEqualToString:beforeSignature]) {
+                                    changedSeen = YES; confirmed = YES; idleDeadline = now + 6.0;
+                                } else {
+                                    return now > deadline;
+                                }
+                            }
+                            if (VSEditorIsBusy(editorVC) && now < idleDeadline) return NO;
+                            return YES;
+                        }, ^(BOOL r) {
+                            if (cancelled()) return;
+                            if (blocked) { blockedPurchase = YES; finishRun(); return; }
+                            if (confirmed) changed++;
+                            VSLog(@"layer %lu: %@", (unsigned long)n, confirmed ? @"✅" : @"⚠️ chưa xác nhận");
+                            next();
+                        });
                     });
                 });
             });
-        });
-    };
-    VSDispatchAfterMS(350, ^{ if (iterate) iterate(); });
+        };
+        VSDispatchAfterMS(200, ^{ if (iterate) iterate(); });
+    });
 }
 
 - (void)executeFeature1ReplaceLayers {
@@ -1169,6 +1276,7 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
     }
 
     NSUInteger runId = [self startNewTaskWithDescription:@"Auto nhập ảnh" initialStatus:@"Chọn 1 ảnh/video…"];
+    g_suppressLayerActionMenu = YES;   // không để menu chọn lớp bật lên giữa chừng
     // CN1: g_autoConfirmPopups giữ NO → không tự bấm Trùng khớp / OK.
     [self requestUserMediaSelectionOnEditor:editor runId:runId completion:^(id clipResponse, VSLayerSnapshot *first) {
         if (runId != g_runIdentifier) return;
@@ -1298,6 +1406,7 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
     id reviewVC = VSFindTopViewControllerNamed(@"VideoReviewEditVC");
     if (!reviewVC) { [self showNotificationAlert:@"Vào màn hình phân cảnh trước" title:@"Sai vị trí"]; return; }
     NSUInteger runId = [self startNewTaskWithDescription:@"Auto code + ảnh" initialStatus:nil];
+    g_suppressLayerActionMenu = YES;   // không để menu chọn lớp bật lên giữa chừng
     NSUInteger origScene = 0;
     @try { origScene = [reviewVC lastViewedSceneIndex]; } @catch (...) {}
     if (!VSTry(^{ [reviewVC showMergeScenes]; })) { [self finalizeTaskWithMessage:@"Không mở được Hợp nhất"]; return; }
