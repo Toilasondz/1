@@ -5,7 +5,7 @@
 //   - Bỏ hẳn chức năng lấy log: không còn bộ đệm log, không còn màn hình xem / sao chép / chia sẻ log.
 //   - Bỏ nút tròn "VS" và menu action sheet cũ. Mở / đóng menu bằng CHẠM 3 NGÓN 2 LẦN.
 //   - Menu mới sang trọng hơn: nền mờ kính, thẻ vàng champagne trên nền đen.
-//   - Sửa crash khi nhập ảnh: không gọi description() lên dữ liệu ảnh khi quét lớp,
+//   - Giảm nguy cơ crash khi nhập ảnh: không gọi description() lên dữ liệu ảnh khi quét lớp,
 //     kiểm tra file media trước khi phát lại, thu nhỏ ảnh QR trước khi lưu, trình bày UI an toàn.
 //
 // LOGIC CHỨC NĂNG:
@@ -37,15 +37,9 @@
 // ============================================================================
 // KHÔNG CÒN LOG TRONG APP (đã bỏ chức năng lấy log).
 // VSLog / VSLogState giờ là lệnh rỗng: không tốn bộ nhớ, không ghi file.
-// Muốn in ra console khi build thử thì đặt VS_DEBUG_LOG = 1.
 // ============================================================================
 
-#define VS_DEBUG_LOG 0
-#if VS_DEBUG_LOG
-#define VSLog(fmt, ...) NSLog(@"[VideoStarTool] " fmt, ##__VA_ARGS__)
-#else
 #define VSLog(...) ((void)0)
-#endif
 #define VSLogState(...) ((void)0)
 
 // ============================================================================
@@ -536,12 +530,6 @@ static BOOL VSEditorIsBusy(id editorVC) {
 
 
 
-static void VSApplySettingsToRun(void) {
-    // Cấu hình cố định đã chạy ổn định (không còn menu cài đặt gỡ lỗi).
-    g_suppressLayerActionMenu = NO;   // không chặn menu chọn lớp
-    g_dismissLayerMenu        = YES;  // tự đóng menu chọn lớp
-    g_guardCancel             = YES;  // chặn Hủy / Đóng do code
-}
 
 
 static BOOL VSPopupWasHandled(id popup) {
@@ -591,17 +579,16 @@ static VSPopupActionStatus VSResolvePopupsImmediately(id editorVC) {
 
         NSString *header = [NSString stringWithFormat:@"%@ %@", [VSSafeValueForKey(popup, @"_title") description] ?: @"", [VSSafeValueForKey(popup, @"_message") description] ?: @""];
         NSString *matchedTitle = nil;
-        NSString *reason = nil;
 
         NSString *matchBtn = firstTitleMatching(matchNames);
-        if (matchBtn) { matchedTitle = matchBtn; reason = @"trùng khớp"; }
+        if (matchBtn) { matchedTitle = matchBtn; }
         else if (VSContains(header, @"Original Preset Layers") || VSContains(header, @"Các lớp Cài đặt sẵn Gốc") ||
                  VSContains(header, VSLocalizedString(@"Original Preset Layers"))) {
-            matchedTitle = firstTitleMatching(okNames); reason = @"thông tin preset";
+            matchedTitle = firstTitleMatching(okNames);
         }
-        else if (titles.count == 1) { matchedTitle = firstTitleMatching(okNames); reason = @"thông báo 1 nút"; }
+        else if (titles.count == 1) { matchedTitle = firstTitleMatching(okNames); }
         else if (firstTitleMatching(matchFallbackNames) && VSContains(header, @"dài hơn")) {
-            matchedTitle = firstTitleMatching(matchFallbackNames); reason = @"trùng khớp (dự phòng)";
+            matchedTitle = firstTitleMatching(matchFallbackNames);
         }
 
         if (!matchedTitle) {
@@ -932,7 +919,6 @@ static void VSInstallCoreHooksOnce(void) {
         };
         VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(cancel), ^(id selfInstance) {
             if (g_guardCancel && !g_createInProgress && !isUserTouch()) {
-                NSArray *st = [NSThread callStackSymbols];
                 VSLog(@"[Guard] CHẶN -cancel do code gọi. Nguồn:\n%@", [[st subarrayWithRange:NSMakeRange(0, MIN((NSUInteger)10, st.count))] componentsJoinedByString:@"\n"]);
                 return;
             }
@@ -944,7 +930,6 @@ static void VSInstallCoreHooksOnce(void) {
         }, &g_origEditorCancelCreate);
         VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(close), ^(id selfInstance) {
             if (g_guardCancel && !g_createInProgress && !isUserTouch()) {
-                NSArray *st = [NSThread callStackSymbols];
                 VSLog(@"[Guard] CHẶN -close do code gọi. Nguồn:\n%@", [[st subarrayWithRange:NSMakeRange(0, MIN((NSUInteger)10, st.count))] componentsJoinedByString:@"\n"]);
                 return;
             }
@@ -955,7 +940,6 @@ static void VSInstallCoreHooksOnce(void) {
         // MultiLayerNavController -cancel: cùng luật với editor.
         VSRobustSwizzleMethod(@"MultiLayerNavController", @selector(cancel), ^(id selfInstance) {
             if (g_guardCancel && !g_createInProgress && !isUserTouch()) {
-                NSArray *st = [NSThread callStackSymbols];
                 VSLog(@"[Guard] CHẶN MultiLayerNavController -cancel do code gọi. Nguồn:\n%@", [[st subarrayWithRange:NSMakeRange(0, MIN((NSUInteger)10, st.count))] componentsJoinedByString:@"\n"]);
                 return;
             }
@@ -1030,12 +1014,6 @@ static void VSInstallCoreHooksOnce(void) {
         }, &g_origNavPopTo);
 
         VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(viewWillDisappear:), ^(id selfInstance, BOOL animated) {
-            if (g_taskActive) {
-                UIViewController *vc = (UIViewController *)selfInstance;
-                BOOL closing = vc.isBeingDismissed || vc.isMovingFromParentViewController || vc.navigationController.isBeingDismissed;
-                VSLog(@"[Trace] editor viewWillDisappear: closing=%d presented=%@ createInProgress=%d", closing,
-                      NSStringFromClass([vc.presentedViewController class]), g_createInProgress);
-            }
             if (g_origEditorWillDisappear) ((void (*)(id, SEL, BOOL))g_origEditorWillDisappear)(selfInstance, @selector(viewWillDisappear:), animated);
         }, &g_origEditorWillDisappear);
 
@@ -1057,7 +1035,6 @@ static void VSInstallCoreHooksOnce(void) {
                 cap = [VSCapturedAdd new];
                 cap.makeSelector = makeSel; cap.object1 = o1; cap.object2 = o2; cap.object3 = o3;
                 g_lastCapturedAdd = cap;
-                NSInteger ln = -1; @try { ln = [selfInstance lastSelectedLayerNum]; } @catch (...) {}
                 VSLog(@"[Capture] confirmAddingLayer(%@) lớp=%ld able=%d", makeSel ? NSStringFromSelector(makeSel) : @"?", (long)ln + 1, able);
             }
             if (g_origConfirmAdd5)
@@ -1277,6 +1254,7 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 - (void)runMenuFeature:(NSInteger)index;
 - (void)stopCurrentTaskFromMenu;
 - (void)presentFromTop:(UIViewController *)controller;
+- (void)presentController:(UIViewController *)controller retry:(BOOL)retry;
 - (void)installMenuGestures;
 - (void)attachMenuGestureToView:(id)object;
 - (void)showMenuHintOnce;
@@ -1317,10 +1295,16 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 // ============================================================================
 // PHẦN 8B: MENU SANG TRỌNG (mở / đóng bằng CHẠM 3 NGÓN 2 LẦN)
 // Nền mờ kính + thẻ vàng champagne trên nền đen. Không còn nút tròn.
+// Chọn chức năng dùng cử chỉ CHẠM 1 NGÓN gắn vào khung menu, xác định hàng theo vị trí chạm,
+// nên chạm 3 ngón (mở / đóng menu) không kích hoạt chức năng nào.
 // ============================================================================
 
 static NSString *const kVSMenuGestureName = @"VSToolMenuGesture3x2";
 static const CGFloat kVSMenuCorner = 26.0;
+static const NSInteger kVSMenuTagStop = 100;     // hành động: nút Dừng
+static const NSInteger kVSMenuTagReopen = 101;   // hành động: Mở lại bảng QR
+static const NSInteger kVSMenuTagClose = 102;    // hành động: Đóng
+// Các hàng chức năng dùng tag 1...4 (trùng số thứ tự chức năng)
 
 static inline UIColor *VSMenuChampagne(void) { return [UIColor colorWithRed:0.97 green:0.94 blue:0.87 alpha:1.0]; }
 
@@ -1375,7 +1359,7 @@ static UIView *VSMakeDivider(CGRect frame) {
     return d;
 }
 
-// Hàng chức năng: hơi thu nhỏ khi chạm
+// Hàng chức năng: chỉ hiệu ứng nhấn (không tự kích hoạt gì; việc kích hoạt do khung menu lo)
 @interface VSToolMenuRowControl : UIControl
 @end
 @implementation VSToolMenuRowControl
@@ -1395,20 +1379,20 @@ static UIView *VSMakeDivider(CGRect frame) {
 - (UIButton *)pillWithTitle:(NSString *)title color:(UIColor *)color frame:(CGRect)frame;
 - (VSToolMenuRowControl *)rowWithIndex:(NSInteger)index title:(NSString *)title subtitle:(NSString *)subtitle frame:(CGRect)frame;
 - (void)haptic;
-- (BOOL)isSingleTouch:(UIEvent *)event;
-- (void)closeTapped:(UIControl *)sender forEvent:(UIEvent *)event;
-- (void)rowTapped:(UIControl *)row forEvent:(UIEvent *)event;
-- (void)stopTapped:(UIControl *)sender forEvent:(UIEvent *)event;
-- (void)reopenQRTapped:(UIControl *)sender forEvent:(UIEvent *)event;
+- (void)dimTapped:(UITapGestureRecognizer *)g;
+- (void)panelTapped:(UITapGestureRecognizer *)g;
+- (void)performActionWithTag:(NSInteger)tag;
 @end
 
 @implementation VSToolMenuView {
     UIView *_panel;
+    NSMutableArray<UIControl *> *_actionControls;   // các hàng / nút có thể chạm, tag = mã hành động
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (!self) return nil;
+    _actionControls = [NSMutableArray array];
     self.backgroundColor = UIColor.clearColor;
     self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
 
@@ -1418,10 +1402,12 @@ static UIView *VSMakeDivider(CGRect frame) {
     blur.userInteractionEnabled = NO;
     [self addSubview:blur];
 
-    UIControl *dim = [[UIControl alloc] initWithFrame:self.bounds];
+    UIView *dim = [[UIView alloc] initWithFrame:self.bounds];
     dim.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     dim.backgroundColor = [UIColor colorWithWhite:0 alpha:0.30];
-    [dim addTarget:self action:@selector(closeTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
+    UITapGestureRecognizer *dimTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(dimTapped:)];
+    dimTap.numberOfTouchesRequired = 1;
+    [dim addGestureRecognizer:dimTap];
     [self addSubview:dim];
 
     [self buildPanel];
@@ -1447,6 +1433,11 @@ static UIView *VSMakeDivider(CGRect frame) {
     _panel.layer.shadowOpacity = 0.7;
     _panel.layer.shadowRadius = 30.0;
     _panel.layer.shadowOffset = CGSizeMake(0, 18);
+    // Cử chỉ chạm 1 ngón trên khung: chạm 3 ngón không khớp nên không kích hoạt hàng nào
+    UITapGestureRecognizer *panelTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(panelTapped:)];
+    panelTap.numberOfTouchesRequired = 1;
+    panelTap.numberOfTapsRequired = 1;
+    [_panel addGestureRecognizer:panelTap];
     [self addSubview:_panel];
 
     UIFont *kickerFont = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
@@ -1487,8 +1478,9 @@ static UIView *VSMakeDivider(CGRect frame) {
         [card addSubview:name];
         UIButton *stop = [self pillWithTitle:@"Dừng" color:[UIColor colorWithRed:1.0 green:0.56 blue:0.52 alpha:1.0]
                                        frame:CGRectMake(cw - 16 - 80, (cardH - 32) / 2.0, 80, 32)];
-        [stop addTarget:self action:@selector(stopTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
+        stop.tag = kVSMenuTagStop;
         [card addSubview:stop];
+        [_actionControls addObject:stop];
     } else {
         cap.attributedText = VSLetterSpaced(@"SẴN SÀNG", 2.0, VSToolAccentColor(), capFont);
         UILabel *hint = VSMenuMakeLabel(CGRectMake(16, 27, cw - 32, 20), @"Chọn một chức năng bên dưới",
@@ -1501,8 +1493,9 @@ static UIView *VSMakeDivider(CGRect frame) {
     if (canReopenQR) {
         UIButton *reopen = [self pillWithTitle:@"Mở lại bảng QR" color:VSToolAccentColor() frame:CGRectMake(inner, y, cw, 40)];
         reopen.layer.cornerRadius = 14.0;
-        [reopen addTarget:self action:@selector(reopenQRTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
+        reopen.tag = kVSMenuTagReopen;
         [_panel addSubview:reopen];
+        [_actionControls addObject:reopen];
         y += 52.0;
     }
 
@@ -1517,8 +1510,8 @@ static UIView *VSMakeDivider(CGRect frame) {
     for (NSUInteger i = 0; i < items.count; i++) {
         VSToolMenuRowControl *row = [self rowWithIndex:(NSInteger)(i + 1) title:items[i][0] subtitle:items[i][1]
                                                  frame:CGRectMake(inner, y, cw, rowH)];
-        [row addTarget:self action:@selector(rowTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
         [_panel addSubview:row];
+        [_actionControls addObject:row];
         y += rowH + gap;
     }
     y += 4.0;
@@ -1532,8 +1525,9 @@ static UIView *VSMakeDivider(CGRect frame) {
     [close setTitle:@"Đóng" forState:UIControlStateNormal];
     [close setTitleColor:VSToolAccentColor() forState:UIControlStateNormal];
     close.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-    [close addTarget:self action:@selector(closeTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
+    close.tag = kVSMenuTagClose;
     [_panel addSubview:close];
+    [_actionControls addObject:close];
     y += 44.0 + 22.0;
 
     // Hoàn tất khung: kích thước thật, nền gradient, bóng
@@ -1631,33 +1625,32 @@ static UIView *VSMakeDivider(CGRect frame) {
     }
 }
 
-// Nút chỉ nhận chạm 1 ngón. Chạm 3 ngón (dùng để mở / đóng menu) không được kích hoạt chức năng.
-- (BOOL)isSingleTouch:(UIEvent *)event {
-    return event.allTouches.count <= 1;
+// Chạm trên khung menu: xác định hàng / nút nào nằm dưới điểm chạm, rồi thực hiện hành động.
+- (void)panelTapped:(UITapGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateRecognized) return;
+    if ([VSTool shared].menuView != self) return;          // menu đang đóng: bỏ qua chạm trùng
+    CGPoint p = [g locationInView:_panel];
+    for (UIControl *c in _actionControls) {
+        if (![c pointInside:[c convertPoint:p fromView:_panel] withEvent:nil]) continue;
+        [self performActionWithTag:c.tag];
+        return;
+    }
 }
 
-- (void)closeTapped:(UIControl *)sender forEvent:(UIEvent *)event {
-    if (![self isSingleTouch:event]) return;
+// Chạm vùng nền ngoài khung: đóng menu.
+- (void)dimTapped:(UITapGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateRecognized) return;
+    if ([VSTool shared].menuView != self) return;
     [[VSTool shared] hideMenuWithCompletion:nil];
 }
 
-- (void)rowTapped:(UIControl *)row forEvent:(UIEvent *)event {
-    if (![self isSingleTouch:event] || [VSTool shared].menuView != self) return;
+- (void)performActionWithTag:(NSInteger)tag {
     [self haptic];
-    NSInteger index = row.tag;
-    [[VSTool shared] hideMenuWithCompletion:^{ [[VSTool shared] runMenuFeature:index]; }];
-}
-
-- (void)stopTapped:(UIControl *)sender forEvent:(UIEvent *)event {
-    if (![self isSingleTouch:event] || [VSTool shared].menuView != self) return;
-    [self haptic];
-    [[VSTool shared] hideMenuWithCompletion:^{ [[VSTool shared] stopCurrentTaskFromMenu]; }];
-}
-
-- (void)reopenQRTapped:(UIControl *)sender forEvent:(UIEvent *)event {
-    if (![self isSingleTouch:event] || [VSTool shared].menuView != self) return;
-    [self haptic];
-    [[VSTool shared] hideMenuWithCompletion:^{ [[VSTool shared] restoreMultiSceneCodePanel]; }];
+    VSTool *tool = [VSTool shared];
+    if (tag == kVSMenuTagClose) { [tool hideMenuWithCompletion:nil]; return; }
+    if (tag == kVSMenuTagStop) { [tool hideMenuWithCompletion:^{ [tool stopCurrentTaskFromMenu]; }]; return; }
+    if (tag == kVSMenuTagReopen) { [tool hideMenuWithCompletion:^{ [tool restoreMultiSceneCodePanel]; }]; return; }
+    [tool hideMenuWithCompletion:^{ [tool runMenuFeature:tag]; }];
 }
 
 @end
@@ -1728,13 +1721,26 @@ static UIView *VSMakeDivider(CGRect frame) {
 
 // Trình bày an toàn: tránh lỗi "already presenting" (NSInvalidArgumentException) làm app crash.
 - (void)presentFromTop:(UIViewController *)controller {
-    if (!controller) return;
+    [self presentController:controller retry:YES];
+}
+
+// Nếu màn hình đang trình bày bị kẹt, bỏ nó đi rồi trình bày lại để thông báo không biến mất im lặng.
+- (void)presentController:(UIViewController *)controller retry:(BOOL)retry {
+    if (!controller || !self.window.rootViewController) return;
     UIViewController *presenter = [self topPresenterVC];
-    if (!presenter || presenter.isBeingPresented || presenter.isBeingDismissed) presenter = self.window.rootViewController;
-    if (!presenter) return;
+    BOOL presented = NO;
     @try {
         [presenter presentViewController:controller animated:YES completion:nil];
+        presented = YES;
     } @catch (NSException *__unused e) {
+        presented = NO;
+    }
+    if (presented || !retry) return;
+    UIViewController *blocker = presenter.presentedViewController;
+    if (blocker && !blocker.isBeingDismissed) {
+        [presenter dismissViewControllerAnimated:NO completion:^{ [self presentController:controller retry:NO]; }];
+    } else {
+        VSDispatchAfterMS(300, ^{ [self presentController:controller retry:NO]; });
     }
 }
 
@@ -1897,7 +1903,9 @@ static UIView *VSMakeDivider(CGRect frame) {
     g_lastCapturedAdd = nil;
     g_chosenMediaKey = nil;
     g_taskActive = YES;
-    VSApplySettingsToRun();
+    g_suppressLayerActionMenu = NO;   // không chặn menu chọn lớp
+    g_dismissLayerMenu = YES;         // tự đóng menu chọn lớp
+    g_guardCancel = YES;              // chặn Hủy / Đóng do code
     self.currentTaskName = name;
     [self updateStatusHUD:status];
     return g_runIdentifier;
@@ -2180,7 +2188,6 @@ static UIView *VSMakeDivider(CGRect frame) {
                         }
 
                         // 3) Xác nhận: media đổi -> chờ editor hết tải -> sang lớp kế. Menu chọn lớp bật lại thì đóng ngay.
-                        CFAbsoluteTime replayStart = CFAbsoluteTimeGetCurrent();
                         __block BOOL confirmed = NO, blocked = NO, changedSeen = NO;
                         __block CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 8.0;
                         __block CFAbsoluteTime idleDeadline = 0;
@@ -2383,7 +2390,7 @@ static UIView *VSMakeDivider(CGRect frame) {
     NSUInteger origScene = 0;
     @try { origScene = [reviewVC lastViewedSceneIndex]; } @catch (...) {}
     if (!VSTry(^{ [reviewVC showMergeScenes]; })) { [self finalizeTaskWithMessage:@"Không mở được Hợp nhất"]; return; }
-    [self displayBottomActionBarWithTitle:@"Chọn phân cảnh" message:@"Chọn đầu và cuối, bấm Bắt đầu" confirmTitle:@"Bắt đầu" onConfirm:^{
+    [self displayBottomActionBarWithTitle:@"Chọn phân cảnh" message:@"Chọn đầu và cuối, bấm Bắt đầu. Preset cần có lớp ảnh/video." confirmTitle:@"Bắt đầu" onConfirm:^{
         [self parseMergeRangeAndPresentCodePanel:reviewVC runId:runId originalLastViewed:origScene];
     } onCancel:^{ VSTry(^{ [reviewVC closeMergePanel]; }); [self terminateCurrentTaskQuietly]; }];
 }
