@@ -1,8 +1,14 @@
 // ============================================================================
-// VideoStarTool.m
-// Video Star 14.3.3 (build 1809)
+// VideoStarTool.m — Video Star 14.3.3 (build 1809)
 //
-// LOGIC:
+// THAY ĐỔI (phiên bản này):
+//   - Bỏ hẳn chức năng lấy log: không còn bộ đệm log, không còn màn hình xem / sao chép / chia sẻ log.
+//   - Bỏ nút tròn "VS" và menu action sheet cũ. Mở / đóng menu bằng CHẠM 3 NGÓN 2 LẦN.
+//   - Menu mới sang trọng hơn: nền mờ kính, thẻ vàng champagne trên nền đen.
+//   - Sửa crash khi nhập ảnh: không gọi description() lên dữ liệu ảnh khi quét lớp,
+//     kiểm tra file media trước khi phát lại, thu nhỏ ảnh QR trước khi lưu, trình bày UI an toàn.
+//
+// LOGIC CHỨC NĂNG:
 //   1. Phân loại lớp:
 //      - VIDEO / IMAGE có nội dung  -> thay media
 //      - RỖNG (chưa nhập)           -> giữ im
@@ -10,9 +16,8 @@
 //   2. Lớp đầu tiên dùng bảng chọn media của app (pickNewContent)
 //      - CN1: chỉ mở bảng chọn + thay media, KHÔNG tự bấm popup
 //      - CN4: nhập code -> mở bảng chọn (scene đầu) + thay media + tự bấm Trùng khớp / OK
-//   3. Các lớp tiếp theo chạy ngầm hoàn toàn, không mở bảng chọn nữa:
-//      bắt lời gọi confirmAddingLayer… của app lúc người dùng chọn media, rồi với mỗi lớp khác
-//      chọn lớp -> gọi lại confirmAddingLayer… (isAbleToShowTheLayerActionMenu:NO).
+//   3. Các lớp tiếp theo chạy ngầm: bắt lời gọi confirmAddingLayer… của app lúc người dùng chọn media,
+//      rồi với mỗi lớp khác chọn lớp -> gọi lại confirmAddingLayer… (isAbleToShowTheLayerActionMenu:NO).
 //      Không bắt được -> tự quay về cách replay pickedWithClipPickerResponse: cũ.
 //   4. CN2: xem QR gần nhất. CN3: tự chia beat.
 // ============================================================================
@@ -25,118 +30,61 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <os/proc.h>
-#import <sys/time.h>
+#import <math.h>
 
 #define VS_MAX_LAYERS 30
-#define VS_TAG "[VideoStarTool] "
 
 // ============================================================================
-// LOG TRONG APP: mọi VSLog đều vào bộ nhớ đệm (5000 dòng) → xem / sao chép / chia sẻ sau mỗi lần chạy
+// KHÔNG CÒN LOG TRONG APP (đã bỏ chức năng lấy log).
+// VSLog / VSLogState giờ là lệnh rỗng: không tốn bộ nhớ, không ghi file.
+// Muốn in ra console khi build thử thì đặt VS_DEBUG_LOG = 1.
 // ============================================================================
 
-static NSMutableArray<NSString *> *g_logLines = nil;
-static dispatch_queue_t g_logQueue = nil;
-static NSUInteger g_runCounter = 0;
+#define VS_DEBUG_LOG 0
+#if VS_DEBUG_LOG
+#define VSLog(fmt, ...) NSLog(@"[VideoStarTool] " fmt, ##__VA_ARGS__)
+#else
+#define VSLog(...) ((void)0)
+#endif
+#define VSLogState(...) ((void)0)
 
-static void VSLogImpl(NSString *line) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        g_logLines = [NSMutableArray array];
-        g_logQueue = dispatch_queue_create("vstool.log", DISPATCH_QUEUE_SERIAL);
-    });
-    struct timeval tv; gettimeofday(&tv, NULL);
-    struct tm tmv; localtime_r(&tv.tv_sec, &tmv);
-    char buf[16]; strftime(buf, sizeof buf, "%H:%M:%S", &tmv);
-    NSString *entry = [NSString stringWithFormat:@"%s.%03d %@", buf, (int)(tv.tv_usec / 1000), line ?: @""];
-    NSLog(@"%s%@", VS_TAG, line);
-    dispatch_async(g_logQueue, ^{
-        [g_logLines addObject:entry];
-        if (g_logLines.count > 5000) [g_logLines removeObjectsInRange:NSMakeRange(0, 1500)];
-    });
-}
-#define VSLog(fmt, ...) VSLogImpl([NSString stringWithFormat:fmt, ##__VA_ARGS__])
+// ============================================================================
+// TIỆN ÍCH AN TOÀN (bộ nhớ / ảnh)
+// ============================================================================
 
-static NSArray<NSString *> *VSLogSnapshotLines(void) {
-    if (!g_logQueue) return @[];
-    __block NSArray<NSString *> *copy = nil;
-    dispatch_sync(g_logQueue, ^{ copy = [g_logLines copy]; });
-    return copy ?: @[];
-}
-
-static void VSLogClear(void) {
-    if (!g_logQueue) return;
-    dispatch_sync(g_logQueue, ^{ [g_logLines removeAllObjects]; });
-}
-
-static BOOL VSLineIsError(NSString *line) {
-    static NSArray *kw = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        kw = @[@"❌", @"⚠️", @"lỗi", @"thất bại", @"fail", @"exception", @"memory", @"timeout",
-               @"bị đóng", @"đã bị đóng", @"popup lạ", @"chưa xác nhận", @"không tìm thấy", @"không thể"];
-    });
-    for (NSString *k in kw) if ([line rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
-    return NO;
-}
-
-static NSArray<NSString *> *VSLogLinesLastRun(void) {
-    NSArray<NSString *> *lines = VSLogSnapshotLines();
-    NSUInteger start = 0;
-    for (NSInteger i = (NSInteger)lines.count - 1; i >= 0; i--) {
-        if ([lines[(NSUInteger)i] containsString:@"════ RUN"]) { start = (NSUInteger)i; break; }
+// Mô tả NGẮN của một giá trị. Không gọi description() lên dữ liệu lớn (NSData, ảnh, mảng):
+// hàm quét lớp chạy liên tục khi chờ app xử lý ảnh, còn description() của NSData là chuỗi hex
+// của cả file, làm tràn RAM và treo app.
+static NSString *VSCheapDescription(id obj) {
+    if (!obj || obj == [NSNull null]) return @"";
+    if ([obj isKindOfClass:[NSString class]]) return (NSString *)obj;
+    if ([obj isKindOfClass:[NSURL class]]) return ((NSURL *)obj).absoluteString ?: @"";
+    if ([obj isKindOfClass:[NSData class]]) return [NSString stringWithFormat:@"data#%lu", (unsigned long)((NSData *)obj).length];
+    if ([obj isKindOfClass:[UIImage class]]) {
+        CGSize sz = ((UIImage *)obj).size;
+        return [NSString stringWithFormat:@"img#%.0fx%.0f", sz.width, sz.height];
     }
-    return [lines subarrayWithRange:NSMakeRange(start, lines.count - start)];
+    if ([obj isKindOfClass:[NSArray class]] || [obj isKindOfClass:[NSDictionary class]] || [obj isKindOfClass:[NSSet class]]) {
+        return [NSString stringWithFormat:@"%@#%lu", NSStringFromClass([obj class]), (unsigned long)[obj count]];
+    }
+    if ([obj isKindOfClass:[NSNumber class]] || [obj isKindOfClass:[NSValue class]]) return [obj description] ?: @"";
+    return [NSString stringWithFormat:@"%@@%p", NSStringFromClass([obj class]), obj];
 }
 
-static NSString *VSLogTextLastRun(void) { return [VSLogLinesLastRun() componentsJoinedByString:@"\n"]; }
-static NSString *VSLogTextAll(void) { return [VSLogSnapshotLines() componentsJoinedByString:@"\n"]; }
-
-static NSString *VSLogTextErrorsLastRun(void) {
-    NSMutableArray *out = [NSMutableArray array];
-    for (NSString *l in VSLogLinesLastRun()) if (VSLineIsError(l) || [l containsString:@"════ RUN"] || [l containsString:@"KẾT QUẢ"]) [out addObject:l];
-    return [out componentsJoinedByString:@"\n"];
-}
-
-static NSUInteger VSLogErrorCountLastRun(void) {
-    NSUInteger n = 0;
-    for (NSString *l in VSLogLinesLastRun()) if (VSLineIsError(l)) n++;
-    return n;
-}
-
-static double VSAvailableMemoryMB(void) {
-    if (@available(iOS 13.0, *)) return (double)os_proc_available_memory() / 1048576.0;
-    return -1;
-}
-
-static NSString *VSLogFilePath(void) {
-    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    return [docs stringByAppendingPathComponent:@"VideoStarTool_Log.txt"];
-}
-
-static NSString *VSLogWriteFile(void) {
-    NSString *header = [NSString stringWithFormat:@"VideoStarTool log — iOS %@ — %@\n\n", UIDevice.currentDevice.systemVersion, UIDevice.currentDevice.model];
-    NSString *text = [header stringByAppendingString:VSLogTextAll()];
-    NSString *path = VSLogFilePath();
-    [text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    return path;
-}
-
-// ============================================================================
-// CÀI ĐẶT GỠ LỖI (bật/tắt từng thay đổi để xác định thủ phạm khi editor bị đóng)
-// ============================================================================
-
-static NSString *const kVSSetSuppressMenu = @"VSTool.suppressMenu";   // chặn hẳn showLayerActionMenu      (mặc định TẮT)
-static NSString *const kVSSetSkipReselect = @"VSTool.skipReselect";   // không gọi selectLayer khi đã chọn  (mặc định TẮT)
-static NSString *const kVSSetDismissMenu  = @"VSTool.dismissMenu";    // tự đóng menu chọn lớp             (mặc định BẬT)
-static NSString *const kVSSetGuardCancel  = @"VSTool.guardCancel";    // chặn Hủy/Đóng do code             (mặc định BẬT)
-
-static BOOL VSSettingBool(NSString *key, BOOL defaultValue) {
-    id v = [NSUserDefaults.standardUserDefaults objectForKey:key];
-    return v ? [v boolValue] : defaultValue;
-}
-static void VSSettingSet(NSString *key, BOOL value) {
-    [NSUserDefaults.standardUserDefaults setBool:value forKey:key];
+// Thu nhỏ ảnh (cạnh dài tối đa maxSide) để không giữ ảnh độ phân giải cao trong RAM.
+static UIImage *VSDownscaledImage(UIImage *image, CGFloat maxSide) {
+    if (!image) return nil;
+    CGSize s = image.size;
+    CGFloat longest = MAX(s.width, s.height);
+    if (longest <= 0 || longest <= maxSide) return image;
+    CGFloat k = maxSide / longest;
+    CGSize target = CGSizeMake(floor(s.width * k), floor(s.height * k));
+    if (target.width < 1 || target.height < 1) return image;
+    UIGraphicsBeginImageContextWithOptions(target, NO, 1.0);
+    [image drawInRect:CGRectMake(0, 0, target.width, target.height)];
+    UIImage *out = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return out ?: image;
 }
 
 // ============================================================================
@@ -245,6 +193,21 @@ static void (^g_activeAddCapturedHandler)(id editorVC) = nil;
 @implementation VSCapturedAdd
 @end
 static VSCapturedAdd *g_lastCapturedAdd = nil;
+
+// File ảnh/video app nhận từ bảng chọn có thể đã bị xoá sau lần chọn đầu. Trước khi phát lại cho lớp khác,
+// kiểm tra các file còn tồn tại không; nếu mất thì bỏ qua lớp đó thay vì để app đọc file không có (dễ crash).
+static BOOL VSCapturedAddFilesExist(id cap) {
+    if (![cap isKindOfClass:[VSCapturedAdd class]]) return YES;
+    VSCapturedAdd *c = (VSCapturedAdd *)cap;
+    NSArray *objs = @[c.object1 ?: [NSNull null], c.object2 ?: [NSNull null], c.object3 ?: [NSNull null]];
+    for (id o in objs) {
+        if (![o isKindOfClass:[NSURL class]]) continue;
+        NSURL *u = (NSURL *)o;
+        if (u.isFileURL && u.path.length && ![[NSFileManager defaultManager] fileExistsAtPath:u.path]) return NO;
+    }
+    return YES;
+}
+
 
 // engine -assetHasBeenLoadedForLayer: (header xác nhận). Không có thì coi như đã tải.
 static BOOL VSLayerAssetLoaded(id engine, NSUInteger n) {
@@ -570,58 +533,16 @@ static BOOL VSEditorIsBusy(id editorVC) {
 // Chẩn đoán
 // ---------------------------------------------------------------------------
 
-static NSString *VSDescribeVCChain(void) {
-    NSMutableArray<NSString *> *parts = [NSMutableArray array];
-    for (UIWindow *w in UIApplication.sharedApplication.windows) {
-        if (w == g_overlayToolWindow || w.hidden) continue;
-        NSMutableArray<NSString *> *chain = [NSMutableArray array];
-        UIViewController *vc = w.rootViewController;
-        for (int guardN = 0; vc && guardN < 10; guardN++) {
-            NSString *d = NSStringFromClass([vc class]);
-            if ([vc isKindOfClass:[UINavigationController class]]) {
-                NSMutableArray<NSString *> *names = [NSMutableArray array];
-                for (UIViewController *c in ((UINavigationController *)vc).viewControllers) [names addObject:NSStringFromClass([c class])];
-                d = [NSString stringWithFormat:@"%@[%@]", d, [names componentsJoinedByString:@","]];
-            }
-            [chain addObject:d];
-            vc = vc.presentedViewController;
-        }
-        [parts addObject:[chain componentsJoinedByString:@" ▸ "]];
-    }
-    return [parts componentsJoinedByString:@"  ||  "];
-}
 
-static NSString *VSPopupSummary(id editorVC) {
-    NSMutableArray<NSString *> *items = [NSMutableArray array];
-    for (id popup in VSCollectAllVisiblePopups(editorVC)) {
-        NSArray<NSString *> *titles = VSPopupButtonTitles(popup, NULL);
-        [items addObject:[NSString stringWithFormat:@"{%@}", [titles componentsJoinedByString:@"|"]]];
-    }
-    return [items componentsJoinedByString:@" "];
-}
 
-static void VSLogState(NSString *tag, id editorVC) {
-    id selected = VSSafeValueForKey(editorVC, @"lastSelectedLayerNum");
-    id bordered = VSSafeValueForKey(editorVC, @"borderedLayerNum");
-    BOOL menuShowing = VSValueIsTruthy(VSSafeValueForKey(editorVC, @"isMenuShowing"));
-    VSLog(@"[State:%@] alive=%d busy=%d selected=%@ bordered=%@ menuShowing=%d mem=%.0fMB popups=[%@] vc=%@",
-          tag, VSEditorIsAlive(editorVC), VSEditorIsBusy(editorVC), selected ?: @"?", bordered ?: @"?", menuShowing,
-          VSAvailableMemoryMB(), VSPopupSummary(editorVC), VSDescribeVCChain());
-}
 
 static void VSApplySettingsToRun(void) {
-    g_suppressLayerActionMenu = VSSettingBool(kVSSetSuppressMenu, NO);
-    g_dismissLayerMenu        = VSSettingBool(kVSSetDismissMenu, YES);
-    g_guardCancel             = VSSettingBool(kVSSetGuardCancel, YES);
-    VSLog(@"[Settings] suppressMenu=%d skipReselect=%d dismissMenu=%d guardCancel=%d",
-          g_suppressLayerActionMenu, VSSettingBool(kVSSetSkipReselect, NO), g_dismissLayerMenu, g_guardCancel);
+    // Cấu hình cố định đã chạy ổn định (không còn menu cài đặt gỡ lỗi).
+    g_suppressLayerActionMenu = NO;   // không chặn menu chọn lớp
+    g_dismissLayerMenu        = YES;  // tự đóng menu chọn lớp
+    g_guardCancel             = YES;  // chặn Hủy / Đóng do code
 }
 
-static void VSLogRunStart(NSString *name) {
-    g_runCounter++;
-    VSLog(@"════ RUN #%lu: %@ ════", (unsigned long)g_runCounter, name ?: @"?");
-    VSLog(@"[Env] iOS %@ | mem=%.0fMB | vc=%@", UIDevice.currentDevice.systemVersion, VSAvailableMemoryMB(), VSDescribeVCChain());
-}
 
 static BOOL VSPopupWasHandled(id popup) {
     return [objc_getAssociatedObject(popup, kVSPopupHandledKey) boolValue];
@@ -765,7 +686,7 @@ static VSLayerSnapshot *VSInspectLayerDetails(id engine, NSUInteger layerNum) {
             snap.mediaKind = VSLayerMediaKindOther;
             id layerTypeObj = VSSafeValueForKey(layer, @"layerType");
             snap.layerTypeValue = [layerTypeObj isKindOfClass:[NSNumber class]] ? [(NSNumber *)layerTypeObj integerValue] : -1;
-            snap.assetInfo = [VSSafeValueForKey(layer, @"origAssetInfo") description] ?: @"";
+            snap.assetInfo = VSCheapDescription(VSSafeValueForKey(layer, @"origAssetInfo"));
 
             // Lớp null / lớp cha (parent) không phải media.
             if (VSValueIsTruthy(VSSafeValueForKey(layer, @"isNullLayer"))) {
@@ -851,10 +772,7 @@ static void VSSelectLayerOnEditor(id editorVC, NSUInteger n, NSUInteger runId, v
     BOOL (^isSelected)(void) = ^BOOL{ return [editorVC lastSelectedLayerNum] == (NSInteger)n; };
     BOOL already = NO;
     @try { already = isSelected(); } @catch (...) {}
-    BOOL skipReselect = VSSettingBool(kVSSetSkipReselect, NO);
-    VSLog(@"[Select] lớp %lu (đã chọn sẵn=%d, skipReselect=%d)", (unsigned long)(n + 1), already, skipReselect);
-    // Tuỳ chọn gỡ lỗi: bỏ qua việc chọn lại lớp đang chọn. Mặc định TẮT (giữ đúng trình tự gọi của bản đầu).
-    if (already && skipReselect) { VSDismissLayerActionMenus(editorVC); done(YES); return; }
+    (void)already;
 
     VSTry(^{ if ([editorVC respondsToSelector:@selector(selectLayer:bordered:)]) [editorVC selectLayer:n bordered:NO]; });
     VSSafePoll(runId, 50, 20, isSelected, ^(BOOL sel) {
@@ -885,18 +803,15 @@ static NSString *VSGetLastQRCodeStoragePath(void) {
 
 static void VSPersistQRCodeImageData(id rawData) {
     if (!rawData) return;
+    // Lưu bản thu nhỏ (cạnh dài <= 1024px) ở luồng nền: QR vẫn đọc được, không giữ ảnh gốc lớn trong RAM.
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
         @autoreleasepool {
             UIImage *image = nil;
             if ([rawData isKindOfClass:[NSData class]]) image = [UIImage imageWithData:(NSData *)rawData];
             else if ([rawData isKindOfClass:[UIImage class]]) image = (UIImage *)rawData;
-            if (image) {
-                NSData *png = UIImagePNGRepresentation(image);
-                if (png.length) {
-                    [png writeToFile:VSGetLastQRCodeStoragePath() atomically:YES];
-                    VSLog(@"Đã lưu QR (%lu bytes)", (unsigned long)png.length);
-                }
-            }
+            if (!image) return;
+            NSData *png = UIImagePNGRepresentation(VSDownscaledImage(image, 1024.0));
+            if (png.length) [png writeToFile:VSGetLastQRCodeStoragePath() atomically:YES];
         }
     });
 }
@@ -1049,13 +964,6 @@ static void VSInstallCoreHooksOnce(void) {
         }, &g_origNavCancel);
 
         // ---- Trace: ai đóng editor? Ghi call stack mỗi lần editor bị dismiss / pop khi tool đang chạy ----
-        void (^traceStack)(NSString *, id) = ^(NSString *what, id obj) {
-            NSArray *st = [NSThread callStackSymbols];
-            NSUInteger n = MIN((NSUInteger)18, st.count);
-            NSUInteger from = st.count > 1 ? 1 : 0;
-            VSLog(@"[Trace] %@ trên %@ | nguồn gọi:\n%@", what, NSStringFromClass([obj class]),
-                  [[st subarrayWithRange:NSMakeRange(from, n - from)] componentsJoinedByString:@"\n"]);
-        };
         BOOL (^involvesEditor)(id) = ^BOOL(id vcObj) {
             NSString *names = [NSString stringWithFormat:@"%@ %@ %@", NSStringFromClass([vcObj class]),
                                NSStringFromClass([[vcObj presentedViewController] class]),
@@ -1078,11 +986,9 @@ static void VSInstallCoreHooksOnce(void) {
                 (VSSafeIsClass(selfInstance, @"MultiLayerWizEffectVC") || VSSafeIsClass(selfInstance, @"MultiLayerNavController")) &&
                 ![(UIViewController *)selfInstance presentedViewController] && !isUserTouch()) {
                 VSLog(@"❌ [Guard] CHẶN dismiss %@ do code gọi (ngoài replay)", NSStringFromClass([selfInstance class]));
-                traceStack(@"dismiss bị chặn", selfInstance);
                 if (completion) dispatch_async(dispatch_get_main_queue(), ^{ ((void (^)(void))completion)(); });
                 return;
             }
-            if (g_taskActive && involvesEditor(selfInstance)) traceStack(@"dismissViewControllerAnimated", selfInstance);
             if (g_origVCDismiss) ((void (*)(id, SEL, BOOL, id))g_origVCDismiss)(selfInstance, @selector(dismissViewControllerAnimated:completion:), animated, completion);
         }, &g_origVCDismiss);
 
@@ -1101,7 +1007,6 @@ static void VSInstallCoreHooksOnce(void) {
                 if (popWouldCloseEditor(selfInstance, nil) && shouldBlockEditorClosure()) {
                     VSLog(@"❌ [Guard] CHẶN popViewControllerAnimated trên %@", NSStringFromClass([selfInstance class])); return nil;
                 }
-                traceStack(@"popViewControllerAnimated", selfInstance);
             }
             return g_origNavPop ? ((id (*)(id, SEL, BOOL))g_origNavPop)(selfInstance, @selector(popViewControllerAnimated:), animated) : nil;
         }, &g_origNavPop);
@@ -1111,7 +1016,6 @@ static void VSInstallCoreHooksOnce(void) {
                 if (popWouldCloseEditor(selfInstance, nil) && shouldBlockEditorClosure()) {
                     VSLog(@"❌ [Guard] CHẶN popToRootViewControllerAnimated trên %@", NSStringFromClass([selfInstance class])); return nil;
                 }
-                traceStack(@"popToRootViewControllerAnimated", selfInstance);
             }
             return g_origNavPopRoot ? ((id (*)(id, SEL, BOOL))g_origNavPopRoot)(selfInstance, @selector(popToRootViewControllerAnimated:), animated) : nil;
         }, &g_origNavPopRoot);
@@ -1121,7 +1025,6 @@ static void VSInstallCoreHooksOnce(void) {
                 if (popWouldCloseEditor(selfInstance, target) && shouldBlockEditorClosure()) {
                     VSLog(@"❌ [Guard] CHẶN popToViewController trên %@", NSStringFromClass([selfInstance class])); return nil;
                 }
-                traceStack(@"popToViewController", selfInstance);
             }
             return g_origNavPopTo ? ((id (*)(id, SEL, id, BOOL))g_origNavPopTo)(selfInstance, @selector(popToViewController:animated:), target, animated) : nil;
         }, &g_origNavPopTo);
@@ -1132,7 +1035,6 @@ static void VSInstallCoreHooksOnce(void) {
                 BOOL closing = vc.isBeingDismissed || vc.isMovingFromParentViewController || vc.navigationController.isBeingDismissed;
                 VSLog(@"[Trace] editor viewWillDisappear: closing=%d presented=%@ createInProgress=%d", closing,
                       NSStringFromClass([vc.presentedViewController class]), g_createInProgress);
-                if (closing && !g_createInProgress) traceStack(@"EDITOR ĐANG BỊ ĐÓNG (không phải do Tạo)", selfInstance);
             }
             if (g_origEditorWillDisappear) ((void (*)(id, SEL, BOOL))g_origEditorWillDisappear)(selfInstance, @selector(viewWillDisappear:), animated);
         }, &g_origEditorWillDisappear);
@@ -1147,14 +1049,6 @@ static void VSInstallCoreHooksOnce(void) {
             if (g_origNavMemWarn) ((void (*)(id, SEL))g_origNavMemWarn)(selfInstance, @selector(didReceiveMemoryWarning));
         }, &g_origNavMemWarn);
 
-        for (NSString *name in @[UIApplicationDidReceiveMemoryWarningNotification, UIApplicationWillResignActiveNotification,
-                                 UIApplicationDidEnterBackgroundNotification, UIApplicationDidBecomeActiveNotification]) {
-            [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
-                if (!g_taskActive) return;
-                BOOL isMem = [note.name isEqualToString:UIApplicationDidReceiveMemoryWarningNotification];
-                VSLog(@"%@[App] %@ mem=%.0fMB", isMem ? @"❌ " : @"", note.name, VSAvailableMemoryMB());
-            }];
-        }
 
         // ---- Bắt lời gọi confirmAddingLayer… mà app tự phát ra sau khi người dùng chọn media ----
         VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(confirmAddingLayer:object:object2:object3:isAbleToShowTheLayerActionMenu:), ^(id selfInstance, SEL makeSel, id o1, id o2, id o3, BOOL able) {
@@ -1253,18 +1147,18 @@ static BOOL VSReplayCapturedAddOnEditor(id editorVC, VSCapturedAdd *cap) {
 }
 @end
 
-static inline UIColor *VSToolCyanColor(void) { return [UIColor colorWithRed:0.25 green:0.85 blue:0.96 alpha:1.0]; }
-static inline UIColor *VSToolCardBackgroundColor(void) { return [UIColor colorWithRed:0.03 green:0.08 blue:0.12 alpha:0.96]; }
+static inline UIColor *VSToolAccentColor(void) { return [UIColor colorWithRed:0.86 green:0.71 blue:0.42 alpha:1.0]; }   // vàng champagne
+static inline UIColor *VSToolCardBackgroundColor(void) { return [UIColor colorWithRed:0.075 green:0.065 blue:0.055 alpha:0.96]; }
 
 static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
     btn.frame = frame;
     btn.layer.cornerRadius = 8.0;
     btn.layer.borderWidth = 1.2;
-    btn.layer.borderColor = VSToolCyanColor().CGColor;
+    btn.layer.borderColor = VSToolAccentColor().CGColor;
     [btn setTitle:title forState:UIControlStateNormal];
-    [btn setTitleColor:VSToolCyanColor() forState:UIControlStateNormal];
-    [btn setTitleColor:[VSToolCyanColor() colorWithAlphaComponent:0.35] forState:UIControlStateDisabled];
+    [btn setTitleColor:VSToolAccentColor() forState:UIControlStateNormal];
+    [btn setTitleColor:[VSToolAccentColor() colorWithAlphaComponent:0.35] forState:UIControlStateDisabled];
     btn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
     return btn;
 }
@@ -1334,85 +1228,16 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
     return s ?: [NSMethodSignature signatureWithObjCTypes:"@@:"];
 }
 - (void)forwardInvocation:(NSInvocation *)invocation {
-    void *zero = NULL;
-    if (invocation.methodSignature.methodReturnLength >= sizeof(void *)) [invocation setReturnValue:&zero];
+    NSUInteger len = invocation.methodSignature.methodReturnLength;
+    if (len == 0) return;
+    // Trả về 0 đúng kích thước kiểu trả về (không ghi / đọc sai bộ nhớ với kiểu struct hoặc float).
+    void *zero = calloc(1, len);
+    [invocation setReturnValue:zero];
+    free(zero);
 }
 @end
 
 
-// ---------------------------------------------------------------------------
-// Màn hình xem log (Lần chạy cuối / Chỉ lỗi / Toàn bộ) + Sao chép + Chia sẻ file .txt
-// ---------------------------------------------------------------------------
-@interface VSToolLogViewController : UIViewController
-@end
-@implementation VSToolLogViewController {
-    UITextView *_textView;
-    UISegmentedControl *_segment;
-    UIButton *_closeButton, *_copyButton, *_shareButton;
-}
-- (UIButton *)makeButton:(NSString *)title action:(SEL)action {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    [b setTitle:title forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    [b setTitleColor:VSToolCyanColor() forState:UIControlStateNormal];
-    [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:b];
-    return b;
-}
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.view.backgroundColor = [UIColor colorWithRed:0.03 green:0.05 blue:0.08 alpha:1.0];
-    _closeButton = [self makeButton:@"Đóng" action:@selector(closeTapped)];
-    _copyButton = [self makeButton:@"Sao chép" action:@selector(copyTapped)];
-    _shareButton = [self makeButton:@"Chia sẻ file" action:@selector(shareTapped)];
-    _segment = [[UISegmentedControl alloc] initWithItems:@[@"Lần chạy cuối", @"Chỉ lỗi", @"Toàn bộ"]];
-    _segment.selectedSegmentIndex = 0;
-    [_segment addTarget:self action:@selector(reload) forControlEvents:UIControlEventValueChanged];
-    [self.view addSubview:_segment];
-    _textView = [[UITextView alloc] init];
-    _textView.editable = NO;
-    _textView.backgroundColor = UIColor.clearColor;
-    _textView.textColor = [UIColor colorWithWhite:0.92 alpha:1.0];
-    _textView.font = [UIFont fontWithName:@"Menlo" size:10.5] ?: [UIFont systemFontOfSize:10.5];
-    [self.view addSubview:_textView];
-    [self reload];
-}
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    UIEdgeInsets ins = self.view.safeAreaInsets;
-    CGFloat w = self.view.bounds.size.width, top = ins.top + 6;
-    _closeButton.frame = CGRectMake(12, top, 70, 36);
-    _copyButton.frame = CGRectMake(w - 12 - 200, top, 90, 36);
-    _shareButton.frame = CGRectMake(w - 12 - 106, top, 106, 36);
-    _segment.frame = CGRectMake(12, top + 44, w - 24, 32);
-    CGFloat textTop = top + 84;
-    _textView.frame = CGRectMake(8, textTop, w - 16, self.view.bounds.size.height - textTop - ins.bottom - 4);
-}
-- (void)reload {
-    NSString *text = nil;
-    switch (_segment.selectedSegmentIndex) {
-        case 1: text = VSLogTextErrorsLastRun(); break;
-        case 2: text = VSLogTextAll(); break;
-        default: text = VSLogTextLastRun(); break;
-    }
-    if (!text.length) text = @"(log trống — chạy một chức năng rồi mở lại)";
-    _textView.text = text;
-    if (_segment.selectedSegmentIndex == 1) [_textView setContentOffset:CGPointZero animated:NO];
-    else [_textView scrollRangeToVisible:NSMakeRange(text.length > 0 ? text.length - 1 : 0, 1)];
-}
-- (void)closeTapped { [self dismissViewControllerAnimated:YES completion:nil]; }
-- (void)copyTapped {
-    UIPasteboard.generalPasteboard.string = _textView.text ?: @"";
-    [_copyButton setTitle:@"Đã chép ✓" forState:UIControlStateNormal];
-    VSDispatchAfterMS(1200, ^{ [self->_copyButton setTitle:@"Sao chép" forState:UIControlStateNormal]; });
-}
-- (void)shareTapped {
-    NSString *path = VSLogWriteFile();
-    UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
-    avc.popoverPresentationController.sourceView = _shareButton;
-    [self presentViewController:avc animated:YES completion:nil];
-}
-@end
 
 // ============================================================================
 // PHẦN 8: VSTOOL INTERFACE
@@ -1423,7 +1248,7 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 
 @interface VSTool : NSObject
 @property (nonatomic, strong) VSToolPassThroughWindow *window;
-@property (nonatomic, strong) UIButton *floatingButton;
+@property (nonatomic, strong) UIView *menuView;
 @property (nonatomic, strong) UILabel *statusHUDLabel;
 @property (nonatomic, strong) UIView *bottomActionBar;
 @property (nonatomic, strong) VSToolQRCodeCaptureProxy *qrCaptureProxy;
@@ -1443,11 +1268,18 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 
 + (instancetype)shared;
 - (void)setupToolInterfaceIfNeeded;
-- (void)adjustFloatingButtonBounds;
 - (void)restoreOriginalQRCodeDelegate;
 - (void)terminateCurrentTaskQuietly;
-- (void)handleFabPan:(UIPanGestureRecognizer *)gesture;
-- (void)fabClicked;
+- (void)toggleMenu;
+- (void)showMenu;
+- (void)hideMenuWithCompletion:(void (^)(void))completion;
+- (void)handleMenuGesture:(UIGestureRecognizer *)g;
+- (void)runMenuFeature:(NSInteger)index;
+- (void)stopCurrentTaskFromMenu;
+- (void)presentFromTop:(UIViewController *)controller;
+- (void)installMenuGestures;
+- (void)attachMenuGestureToView:(id)object;
+- (void)showMenuHintOnce;
 - (UIViewController *)topPresenterVC;
 - (void)updateStatusHUD:(NSString *)message;
 - (void)showNotificationAlert:(NSString *)message title:(NSString *)title;
@@ -1459,8 +1291,6 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 - (NSUInteger)startNewTaskWithDescription:(NSString *)taskName initialStatus:(NSString *)initialStatus;
 - (void)finalizeTaskWithMessage:(NSString *)msg;
 - (void)showRunResultAlert:(NSString *)msg title:(NSString *)title;
-- (void)presentLogViewer;
-- (void)showDebugSettings;
 
 - (void)requestUserMediaSelectionOnEditor:(id)editorVC runId:(NSUInteger)runId completion:(void (^)(id clipResponse, VSLayerSnapshot *firstLayerInfo))done;
 - (void)applyMediaResponse:(id)response toEditor:(id)editorVC skipLayer:(NSInteger)skipIndex runId:(NSUInteger)runId completion:(void (^)(NSUInteger changedCount, NSUInteger totalCount, NSUInteger failedCount, BOOL blockedByPurchase))done;
@@ -1484,8 +1314,356 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 - (void)triggerCreateInEditor:(id)editorVC runId:(NSUInteger)runId completion:(void (^)(NSString *errorMessage))done;
 @end
 
+// ============================================================================
+// PHẦN 8B: MENU SANG TRỌNG (mở / đóng bằng CHẠM 3 NGÓN 2 LẦN)
+// Nền mờ kính + thẻ vàng champagne trên nền đen. Không còn nút tròn.
+// ============================================================================
+
+static NSString *const kVSMenuGestureName = @"VSToolMenuGesture3x2";
+static const CGFloat kVSMenuCorner = 26.0;
+
+static inline UIColor *VSMenuChampagne(void) { return [UIColor colorWithRed:0.97 green:0.94 blue:0.87 alpha:1.0]; }
+
+static UIFont *VSMenuDisplayFont(CGFloat size) {
+    return [UIFont fontWithName:@"Didot-Bold" size:size] ?: [UIFont boldSystemFontOfSize:size];
+}
+
+static NSAttributedString *VSLetterSpaced(NSString *text, CGFloat kern, UIColor *color, UIFont *font) {
+    return [[NSAttributedString alloc] initWithString:text attributes:@{
+        NSKernAttributeName: @(kern),
+        NSForegroundColorAttributeName: color,
+        NSFontAttributeName: font
+    }];
+}
+
+static UILabel *VSMenuMakeLabel(CGRect frame, NSString *text, UIFont *font, UIColor *color, NSTextAlignment align) {
+    UILabel *l = [[UILabel alloc] initWithFrame:frame];
+    l.text = text;
+    l.font = font;
+    l.textColor = color;
+    l.textAlignment = align;
+    l.adjustsFontSizeToFitWidth = YES;
+    l.minimumScaleFactor = 0.75;
+    l.userInteractionEnabled = NO;
+    return l;
+}
+
+static CAGradientLayer *VSMakeGoldGradient(CGRect frame, CGFloat corner) {
+    CAGradientLayer *g = [CAGradientLayer layer];
+    g.frame = frame;
+    g.cornerRadius = corner;
+    g.masksToBounds = YES;
+    g.colors = @[(id)[UIColor colorWithRed:1.00 green:0.90 blue:0.64 alpha:1.0].CGColor,
+                 (id)[UIColor colorWithRed:0.66 green:0.48 blue:0.20 alpha:1.0].CGColor];
+    g.startPoint = CGPointMake(0.0, 0.0);
+    g.endPoint = CGPointMake(1.0, 1.0);
+    return g;
+}
+
+static UIView *VSMakeDivider(CGRect frame) {
+    UIView *d = [[UIView alloc] initWithFrame:frame];
+    d.userInteractionEnabled = NO;
+    CAGradientLayer *g = [CAGradientLayer layer];
+    g.frame = CGRectMake(0, 0, frame.size.width, frame.size.height);
+    g.startPoint = CGPointMake(0.0, 0.5);
+    g.endPoint = CGPointMake(1.0, 0.5);
+    UIColor *gold = VSToolAccentColor();
+    g.colors = @[(id)[gold colorWithAlphaComponent:0.0].CGColor,
+                 (id)gold.CGColor,
+                 (id)[gold colorWithAlphaComponent:0.0].CGColor];
+    [d.layer addSublayer:g];
+    return d;
+}
+
+// Hàng chức năng: hơi thu nhỏ khi chạm
+@interface VSToolMenuRowControl : UIControl
+@end
+@implementation VSToolMenuRowControl
+- (void)setHighlighted:(BOOL)highlighted {
+    [super setHighlighted:highlighted];
+    [UIView animateWithDuration:0.14 delay:0 options:UIViewAnimationOptionAllowUserInteraction animations:^{
+        self.transform = highlighted ? CGAffineTransformMakeScale(0.975, 0.975) : CGAffineTransformIdentity;
+        self.backgroundColor = [UIColor colorWithWhite:1.0 alpha:(highlighted ? 0.10 : 0.05)];
+    } completion:nil];
+}
+@end
+
+@interface VSToolMenuView : UIView
+- (void)showAnimated;
+- (void)hideAnimatedWithCompletion:(void (^)(void))completion;
+- (void)buildPanel;
+- (UIButton *)pillWithTitle:(NSString *)title color:(UIColor *)color frame:(CGRect)frame;
+- (VSToolMenuRowControl *)rowWithIndex:(NSInteger)index title:(NSString *)title subtitle:(NSString *)subtitle frame:(CGRect)frame;
+- (void)haptic;
+- (BOOL)isSingleTouch:(UIEvent *)event;
+- (void)closeTapped:(UIControl *)sender forEvent:(UIEvent *)event;
+- (void)rowTapped:(UIControl *)row forEvent:(UIEvent *)event;
+- (void)stopTapped:(UIControl *)sender forEvent:(UIEvent *)event;
+- (void)reopenQRTapped:(UIControl *)sender forEvent:(UIEvent *)event;
+@end
+
+@implementation VSToolMenuView {
+    UIView *_panel;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    self.backgroundColor = UIColor.clearColor;
+    self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+
+    UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleDark]];
+    blur.frame = self.bounds;
+    blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    blur.userInteractionEnabled = NO;
+    [self addSubview:blur];
+
+    UIControl *dim = [[UIControl alloc] initWithFrame:self.bounds];
+    dim.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    dim.backgroundColor = [UIColor colorWithWhite:0 alpha:0.30];
+    [dim addTarget:self action:@selector(closeTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:dim];
+
+    [self buildPanel];
+    return self;
+}
+
+- (void)buildPanel {
+    VSTool *tool = [VSTool shared];
+    BOOL running = tool.currentTaskName.length > 0;
+    BOOL canReopenQR = running && tool.multiSceneCardView && tool.multiSceneCardView.hidden && tool.multiSceneActiveCapturingIndex >= 0;
+
+    CGFloat W = self.bounds.size.width;
+    CGFloat pw = MIN(W - 40.0, 360.0);
+    CGFloat inner = 22.0;
+    CGFloat cw = pw - inner * 2.0;
+
+    _panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, 100)];
+    _panel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
+                              UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
+    _panel.layer.borderWidth = 1.0;
+    _panel.layer.borderColor = [VSToolAccentColor() colorWithAlphaComponent:0.45].CGColor;
+    _panel.layer.shadowColor = UIColor.blackColor.CGColor;
+    _panel.layer.shadowOpacity = 0.7;
+    _panel.layer.shadowRadius = 30.0;
+    _panel.layer.shadowOffset = CGSizeMake(0, 18);
+    [self addSubview:_panel];
+
+    UIFont *kickerFont = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    CGFloat y = 20.0;
+
+    UILabel *kicker = VSMenuMakeLabel(CGRectMake(inner, y, cw, 14), nil, kickerFont, VSToolAccentColor(), NSTextAlignmentCenter);
+    kicker.attributedText = VSLetterSpaced(@"VIDEO STAR", 3.0, VSToolAccentColor(), kickerFont);
+    [_panel addSubview:kicker];
+    y += 22.0;
+
+    UILabel *title = VSMenuMakeLabel(CGRectMake(inner, y, cw, 32), @"VideoStarTool", VSMenuDisplayFont(25), VSMenuChampagne(), NSTextAlignmentCenter);
+    [_panel addSubview:title];
+    y += 36.0;
+
+    UILabel *sub = VSMenuMakeLabel(CGRectMake(inner, y, cw, 16), @"Chạm 3 ngón 2 lần để mở hoặc đóng menu",
+                                   [UIFont systemFontOfSize:11.5], [UIColor colorWithWhite:1.0 alpha:0.55], NSTextAlignmentCenter);
+    [_panel addSubview:sub];
+    y += 26.0;
+
+    [_panel addSubview:VSMakeDivider(CGRectMake(inner, y, cw, 1))];
+    y += 16.0;
+
+    // Thẻ trạng thái
+    CGFloat cardH = 56.0;
+    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(inner, y, cw, cardH)];
+    card.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.04];
+    card.layer.cornerRadius = 16.0;
+    card.layer.borderWidth = 1.0;
+    card.layer.borderColor = [VSToolAccentColor() colorWithAlphaComponent:0.22].CGColor;
+    [_panel addSubview:card];
+
+    UIFont *capFont = [UIFont systemFontOfSize:10.5 weight:UIFontWeightSemibold];
+    UILabel *cap = VSMenuMakeLabel(CGRectMake(16, 10, cw - 120, 14), nil, capFont, VSToolAccentColor(), NSTextAlignmentLeft);
+    if (running) {
+        cap.attributedText = VSLetterSpaced(@"ĐANG CHẠY", 2.0, VSToolAccentColor(), capFont);
+        UILabel *name = VSMenuMakeLabel(CGRectMake(16, 27, cw - 120, 20), tool.currentTaskName,
+                                        [UIFont systemFontOfSize:14 weight:UIFontWeightMedium], [UIColor colorWithWhite:1.0 alpha:0.92], NSTextAlignmentLeft);
+        [card addSubview:name];
+        UIButton *stop = [self pillWithTitle:@"Dừng" color:[UIColor colorWithRed:1.0 green:0.56 blue:0.52 alpha:1.0]
+                                       frame:CGRectMake(cw - 16 - 80, (cardH - 32) / 2.0, 80, 32)];
+        [stop addTarget:self action:@selector(stopTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
+        [card addSubview:stop];
+    } else {
+        cap.attributedText = VSLetterSpaced(@"SẴN SÀNG", 2.0, VSToolAccentColor(), capFont);
+        UILabel *hint = VSMenuMakeLabel(CGRectMake(16, 27, cw - 32, 20), @"Chọn một chức năng bên dưới",
+                                        [UIFont systemFontOfSize:13], [UIColor colorWithWhite:1.0 alpha:0.7], NSTextAlignmentLeft);
+        [card addSubview:hint];
+    }
+    [card addSubview:cap];
+    y += cardH + 12.0;
+
+    if (canReopenQR) {
+        UIButton *reopen = [self pillWithTitle:@"Mở lại bảng QR" color:VSToolAccentColor() frame:CGRectMake(inner, y, cw, 40)];
+        reopen.layer.cornerRadius = 14.0;
+        [reopen addTarget:self action:@selector(reopenQRTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
+        [_panel addSubview:reopen];
+        y += 52.0;
+    }
+
+    // Bốn chức năng
+    NSArray<NSArray<NSString *> *> *items = @[
+        @[@"Auto nhập ảnh vào các lớp", @"Chọn 1 ảnh/video, tự thay cho các lớp còn lại"],
+        @[@"Hiển thị code gần nhất", @"Xem lại mã QR vừa nhập"],
+        @[@"Auto chia beat", @"Tự chia phân cảnh theo nhịp"],
+        @[@"Auto nhập code + ảnh vào phân cảnh", @"Nhập hàng loạt code và media theo từng phân cảnh"]
+    ];
+    CGFloat rowH = 54.0, gap = 8.0;
+    for (NSUInteger i = 0; i < items.count; i++) {
+        VSToolMenuRowControl *row = [self rowWithIndex:(NSInteger)(i + 1) title:items[i][0] subtitle:items[i][1]
+                                                 frame:CGRectMake(inner, y, cw, rowH)];
+        [row addTarget:self action:@selector(rowTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
+        [_panel addSubview:row];
+        y += rowH + gap;
+    }
+    y += 4.0;
+
+    // Nút Đóng
+    UIButton *close = [UIButton buttonWithType:UIButtonTypeCustom];
+    close.frame = CGRectMake(inner, y, cw, 44);
+    close.layer.cornerRadius = 14.0;
+    close.layer.borderWidth = 1.0;
+    close.layer.borderColor = VSToolAccentColor().CGColor;
+    [close setTitle:@"Đóng" forState:UIControlStateNormal];
+    [close setTitleColor:VSToolAccentColor() forState:UIControlStateNormal];
+    close.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    [close addTarget:self action:@selector(closeTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
+    [_panel addSubview:close];
+    y += 44.0 + 22.0;
+
+    // Hoàn tất khung: kích thước thật, nền gradient, bóng
+    CGFloat ph = y;
+    _panel.frame = CGRectMake(0, 0, pw, ph);
+    _panel.center = CGPointMake(W / 2.0, self.bounds.size.height / 2.0);
+    _panel.layer.cornerRadius = kVSMenuCorner;
+    _panel.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:_panel.bounds cornerRadius:kVSMenuCorner].CGPath;
+
+    CAGradientLayer *bg = [CAGradientLayer layer];
+    bg.frame = CGRectInset(_panel.bounds, 1.0, 1.0);
+    bg.cornerRadius = kVSMenuCorner - 1.0;
+    bg.masksToBounds = YES;
+    bg.colors = @[(id)[UIColor colorWithRed:0.12 green:0.105 blue:0.09 alpha:1.0].CGColor,
+                  (id)[UIColor colorWithRed:0.035 green:0.035 blue:0.045 alpha:1.0].CGColor];
+    bg.startPoint = CGPointMake(0.5, 0.0);
+    bg.endPoint = CGPointMake(0.5, 1.0);
+    [_panel.layer insertSublayer:bg atIndex:0];
+}
+
+- (UIButton *)pillWithTitle:(NSString *)title color:(UIColor *)color frame:(CGRect)frame {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.frame = frame;
+    b.layer.cornerRadius = frame.size.height / 2.0;
+    b.layer.borderWidth = 1.0;
+    b.layer.borderColor = [color colorWithAlphaComponent:0.7].CGColor;
+    [b setTitle:title forState:UIControlStateNormal];
+    [b setTitleColor:color forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    return b;
+}
+
+- (VSToolMenuRowControl *)rowWithIndex:(NSInteger)index title:(NSString *)title subtitle:(NSString *)subtitle frame:(CGRect)frame {
+    VSToolMenuRowControl *row = [[VSToolMenuRowControl alloc] initWithFrame:frame];
+    row.tag = index;
+    row.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.05];
+    row.layer.cornerRadius = 16.0;
+    row.layer.borderWidth = 1.0;
+    row.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.08].CGColor;
+    row.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+
+    CGFloat d = 36.0;
+    UIView *badge = [[UIView alloc] initWithFrame:CGRectMake(14, (frame.size.height - d) / 2.0, d, d)];
+    badge.userInteractionEnabled = NO;
+    badge.layer.cornerRadius = d / 2.0;
+    badge.clipsToBounds = YES;
+    [badge.layer insertSublayer:VSMakeGoldGradient(CGRectMake(0, 0, d, d), d / 2.0) atIndex:0];
+    UILabel *num = VSMenuMakeLabel(CGRectMake(0, 0, d, d), [NSString stringWithFormat:@"%ld", (long)index],
+                                   VSMenuDisplayFont(17), [UIColor colorWithRed:0.10 green:0.07 blue:0.03 alpha:1.0],
+                                   NSTextAlignmentCenter);
+    [badge addSubview:num];
+    [row addSubview:badge];
+
+    CGFloat tx = 14.0 + d + 14.0;
+    CGFloat tw = frame.size.width - tx - 40.0;
+    UILabel *t = VSMenuMakeLabel(CGRectMake(tx, 10, tw, 20), title,
+                                 [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold], VSMenuChampagne(), NSTextAlignmentLeft);
+    UILabel *s = VSMenuMakeLabel(CGRectMake(tx, 30, tw, 16), subtitle,
+                                 [UIFont systemFontOfSize:11.5], [UIColor colorWithWhite:1.0 alpha:0.5], NSTextAlignmentLeft);
+    [row addSubview:t];
+    [row addSubview:s];
+
+    UILabel *chev = VSMenuMakeLabel(CGRectMake(frame.size.width - 34, (frame.size.height - 26) / 2.0, 20, 26), @"›",
+                                    [UIFont systemFontOfSize:24 weight:UIFontWeightLight], VSToolAccentColor(), NSTextAlignmentCenter);
+    chev.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    [row addSubview:chev];
+    return row;
+}
+
+- (void)showAnimated {
+    self.alpha = 0.0;
+    _panel.transform = CGAffineTransformMakeScale(0.92, 0.92);
+    [UIView animateWithDuration:0.35 delay:0 usingSpringWithDamping:0.82 initialSpringVelocity:0.4
+                        options:UIViewAnimationOptionCurveEaseOut animations:^{
+        self.alpha = 1.0;
+        self->_panel.transform = CGAffineTransformIdentity;
+    } completion:nil];
+}
+
+- (void)hideAnimatedWithCompletion:(void (^)(void))completion {
+    [UIView animateWithDuration:0.2 delay:0 options:UIViewAnimationOptionCurveEaseIn animations:^{
+        self.alpha = 0.0;
+        self->_panel.transform = CGAffineTransformMakeScale(0.96, 0.96);
+    } completion:^(BOOL finished) {
+        [self removeFromSuperview];
+        if (completion) completion();
+    }];
+}
+
+- (void)haptic {
+    if (@available(iOS 10.0, *)) {
+        UIImpactFeedbackGenerator *g = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+        [g prepare];
+        [g impactOccurred];
+    }
+}
+
+// Nút chỉ nhận chạm 1 ngón. Chạm 3 ngón (dùng để mở / đóng menu) không được kích hoạt chức năng.
+- (BOOL)isSingleTouch:(UIEvent *)event {
+    return event.allTouches.count <= 1;
+}
+
+- (void)closeTapped:(UIControl *)sender forEvent:(UIEvent *)event {
+    if (![self isSingleTouch:event]) return;
+    [[VSTool shared] hideMenuWithCompletion:nil];
+}
+
+- (void)rowTapped:(UIControl *)row forEvent:(UIEvent *)event {
+    if (![self isSingleTouch:event] || [VSTool shared].menuView != self) return;
+    [self haptic];
+    NSInteger index = row.tag;
+    [[VSTool shared] hideMenuWithCompletion:^{ [[VSTool shared] runMenuFeature:index]; }];
+}
+
+- (void)stopTapped:(UIControl *)sender forEvent:(UIEvent *)event {
+    if (![self isSingleTouch:event] || [VSTool shared].menuView != self) return;
+    [self haptic];
+    [[VSTool shared] hideMenuWithCompletion:^{ [[VSTool shared] stopCurrentTaskFromMenu]; }];
+}
+
+- (void)reopenQRTapped:(UIControl *)sender forEvent:(UIEvent *)event {
+    if (![self isSingleTouch:event] || [VSTool shared].menuView != self) return;
+    [self haptic];
+    [[VSTool shared] hideMenuWithCompletion:^{ [[VSTool shared] restoreMultiSceneCodePanel]; }];
+}
+
+@end
+
 @implementation VSToolRootVC
-- (void)viewDidLayoutSubviews { [super viewDidLayoutSubviews]; [VSTool.shared adjustFloatingButtonBounds]; }
+
 @end
 
 @implementation VSTool
@@ -1516,18 +1694,6 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
     root.view.backgroundColor = UIColor.clearColor;
     w.rootViewController = root;
 
-    UIButton *fab = [UIButton buttonWithType:UIButtonTypeCustom];
-    fab.frame = CGRectMake(b.size.width - 64, b.size.height * 0.35, 48, 48);
-    fab.backgroundColor = [UIColor colorWithRed:0.10 green:0.10 blue:0.13 alpha:0.85];
-    fab.layer.cornerRadius = 24.0;
-    fab.layer.borderWidth = 1.5;
-    fab.layer.borderColor = VSToolCyanColor().CGColor;
-    [fab setTitle:@"VS" forState:UIControlStateNormal];
-    fab.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    [fab setTitleColor:VSToolCyanColor() forState:UIControlStateNormal];
-    [fab addTarget:self action:@selector(fabClicked) forControlEvents:UIControlEventTouchUpInside];
-    [fab addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handleFabPan:)]];
-    [root.view addSubview:fab];
 
     UILabel *hud = [[UILabel alloc] init];
     hud.backgroundColor = [UIColor colorWithWhite:0 alpha:0.82];
@@ -1538,36 +1704,38 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
     hud.layer.cornerRadius = 10; hud.clipsToBounds = YES; hud.hidden = YES;
     [root.view addSubview:hud];
 
-    self.window = w; self.floatingButton = fab; self.statusHUDLabel = hud;
+    self.window = w; self.statusHUDLabel = hud;
     self.multiSceneActiveCapturingIndex = -1;
     g_overlayToolWindow = w;
     w.hidden = NO;
     VSInstallCoreHooksOnce();
+    [self installMenuGestures];
     VSLog(@"Giao diện VSTool đã cài");
 }
 
-- (void)adjustFloatingButtonBounds {
-    if (!self.window || !self.floatingButton) return;
-    UIView *c = self.window.rootViewController.view;
-    UIEdgeInsets ins = c.safeAreaInsets;
-    CGFloat hw = self.floatingButton.bounds.size.width / 2.0;
-    CGPoint p = self.floatingButton.center;
-    p.x = MIN(MAX(p.x, hw + 4), c.bounds.size.width - hw - 4);
-    p.y = MIN(MAX(p.y, ins.top + hw + 4), c.bounds.size.height - ins.bottom - hw - 4);
-    self.floatingButton.center = p;
-}
 
-- (void)handleFabPan:(UIPanGestureRecognizer *)g {
-    CGPoint t = [g translationInView:self.floatingButton.superview];
-    self.floatingButton.center = CGPointMake(self.floatingButton.center.x + t.x, self.floatingButton.center.y + t.y);
-    [g setTranslation:CGPointZero inView:self.floatingButton.superview];
-    if (g.state == UIGestureRecognizerStateEnded) [self adjustFloatingButtonBounds];
-}
 
 - (UIViewController *)topPresenterVC {
     UIViewController *vc = self.window.rootViewController;
-    while (vc.presentedViewController) vc = vc.presentedViewController;
+    // Đi xuống chuỗi presentedViewController, nhưng không đi vào VC đang bị đóng.
+    for (int guardN = 0; guardN < 12 && vc.presentedViewController; guardN++) {
+        UIViewController *next = vc.presentedViewController;
+        if (next.isBeingDismissed) break;
+        vc = next;
+    }
     return vc;
+}
+
+// Trình bày an toàn: tránh lỗi "already presenting" (NSInvalidArgumentException) làm app crash.
+- (void)presentFromTop:(UIViewController *)controller {
+    if (!controller) return;
+    UIViewController *presenter = [self topPresenterVC];
+    if (!presenter || presenter.isBeingPresented || presenter.isBeingDismissed) presenter = self.window.rootViewController;
+    if (!presenter) return;
+    @try {
+        [presenter presentViewController:controller animated:YES completion:nil];
+    } @catch (NSException *__unused e) {
+    }
 }
 
 - (void)updateStatusHUD:(NSString *)msg {
@@ -1583,7 +1751,7 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
     [self updateStatusHUD:nil];
     UIAlertController *a = [UIAlertController alertControllerWithTitle:title ?: @"VideoStarTool" message:msg preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    [[self topPresenterVC] presentViewController:a animated:YES completion:nil];
+    [self presentFromTop:a];
 }
 
 - (void)dismissBottomActionBar { [self.bottomActionBar removeFromSuperview]; self.bottomActionBar = nil; }
@@ -1593,10 +1761,10 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
     card.backgroundColor = VSToolCardBackgroundColor();
     card.layer.cornerRadius = 14;
     card.layer.borderWidth = 1.2;
-    card.layer.borderColor = VSToolCyanColor().CGColor;
+    card.layer.borderColor = VSToolAccentColor().CGColor;
     card.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
     UILabel *h = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, f.size.width - 32, 24)];
-    h.text = title; h.textColor = VSToolCyanColor(); h.font = [UIFont boldSystemFontOfSize:17];
+    h.text = title; h.textColor = VSToolAccentColor(); h.font = [UIFont boldSystemFontOfSize:17];
     h.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     UILabel *s = [[UILabel alloc] initWithFrame:CGRectMake(16, 42, f.size.width - 32, 36)];
     s.text = subtitle; s.numberOfLines = 0; s.textColor = [UIColor colorWithWhite:0.86 alpha:1.0]; s.font = [UIFont systemFontOfSize:13];
@@ -1625,28 +1793,95 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 - (void)handleBottomBarConfirm { void (^cb)(void) = self.bottomBarConfirmBlock; self.bottomBarConfirmBlock = nil; self.bottomBarCancelBlock = nil; [self dismissBottomActionBar]; if (cb) cb(); }
 - (void)handleBottomBarCancel { void (^cb)(void) = self.bottomBarCancelBlock; self.bottomBarConfirmBlock = nil; self.bottomBarCancelBlock = nil; [self dismissBottomActionBar]; if (cb) cb(); }
 
-- (void)fabClicked {
+// ---------------------------------------------------------------------------
+// Menu: CHẠM 3 NGÓN 2 LẦN để mở / đóng
+// ---------------------------------------------------------------------------
+
+- (void)installMenuGestures {
+    [self attachMenuGestureToView:self.window.rootViewController.view];
+    for (UIWindow *w in UIApplication.sharedApplication.windows) [self attachMenuGestureToView:w];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIWindowDidBecomeVisibleNotification
+                                                    object:nil
+                                                     queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(NSNotification *note) {
+        [self attachMenuGestureToView:note.object];
+    }];
+    [self showMenuHintOnce];
+}
+
+// Gắn cử chỉ "3 ngón chạm 2 lần" vào cửa sổ của app. Không cản các chạm thường của app.
+- (void)attachMenuGestureToView:(id)object {
+    if (![object isKindOfClass:[UIView class]]) return;
+    UIView *view = (UIView *)object;
+    if (view == g_overlayToolWindow || view.hidden) return;
+    NSString *cn = NSStringFromClass([view class]);
+    if ([cn containsString:@"Keyboard"] || [cn containsString:@"TextEffects"]) return;
+    for (UIGestureRecognizer *g in view.gestureRecognizers) {
+        if ([g.name isEqualToString:kVSMenuGestureName]) return;
+    }
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleMenuGesture:)];
+    tap.numberOfTouchesRequired = 3;
+    tap.numberOfTapsRequired = 2;
+    tap.cancelsTouchesInView = NO;
+    tap.delaysTouchesBegan = NO;
+    tap.delaysTouchesEnded = NO;
+    tap.name = kVSMenuGestureName;
+    [view addGestureRecognizer:tap];
+}
+
+- (void)handleMenuGesture:(UIGestureRecognizer *)g {
+    if (g.state == UIGestureRecognizerStateRecognized) [self toggleMenu];
+}
+
+- (void)toggleMenu {
+    if (self.menuView) { [self hideMenuWithCompletion:nil]; return; }
+    [self showMenu];
+}
+
+- (void)showMenu {
+    UIView *host = self.window.rootViewController.view;
+    if (!host || self.menuView) return;
+    VSToolMenuView *menu = [[VSToolMenuView alloc] initWithFrame:host.bounds];
+    [host addSubview:menu];
+    self.menuView = menu;
+    [menu showAnimated];
+}
+
+- (void)hideMenuWithCompletion:(void (^)(void))completion {
+    UIView *menu = self.menuView;
+    self.menuView = nil;
+    if (!menu) { if (completion) completion(); return; }
+    [(VSToolMenuView *)menu hideAnimatedWithCompletion:completion];
+}
+
+- (void)runMenuFeature:(NSInteger)index {
     if (self.currentTaskName) {
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Đang chạy" message:self.currentTaskName preferredStyle:UIAlertControllerStyleAlert];
-        // Chỉ cho "Mở lại bảng QR" khi bảng đang bị ẩn VÌ đang quét QR (không phải lúc tool đang xử lý scene).
-        if (self.multiSceneCardView && self.multiSceneCardView.hidden && self.multiSceneActiveCapturingIndex >= 0)
-            [a addAction:[UIAlertAction actionWithTitle:@"Mở lại bảng QR" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [self restoreMultiSceneCodePanel]; }]];
-        [a addAction:[UIAlertAction actionWithTitle:@"Dừng" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) { [self terminateCurrentTaskQuietly]; [self showNotificationAlert:@"Đã dừng" title:@"Đã Dừng"]; }]];
-        [a addAction:[UIAlertAction actionWithTitle:@"Tiếp tục" style:UIAlertActionStyleCancel handler:nil]];
-        [[self topPresenterVC] presentViewController:a animated:YES completion:nil];
+        [self showNotificationAlert:@"Đang có tác vụ chạy. Mở menu và chọn Dừng trước." title:@"Đang chạy"];
         return;
     }
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"VideoStarTool" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"1. Auto nhập ảnh vào các lớp" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [self executeFeature1ReplaceLayers]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"2. Hiển thị code gần nhất" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [self executeFeature2DisplayLastCode]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"3. Auto chia beat" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [self executeFeature3AutoSplitBeat]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"4. Auto nhập code + ảnh vào phân cảnh" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [self executeFeature4BatchMultiScene]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"5. Xem log lần chạy cuối" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [self presentLogViewer]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"6. Cài đặt gỡ lỗi" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [self showDebugSettings]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
-    sheet.popoverPresentationController.sourceView = self.floatingButton;
-    sheet.popoverPresentationController.sourceRect = self.floatingButton.bounds;
-    [[self topPresenterVC] presentViewController:sheet animated:YES completion:nil];
+    switch (index) {
+        case 1: [self executeFeature1ReplaceLayers]; break;
+        case 2: [self executeFeature2DisplayLastCode]; break;
+        case 3: [self executeFeature3AutoSplitBeat]; break;
+        case 4: [self executeFeature4BatchMultiScene]; break;
+        default: break;
+    }
+}
+
+- (void)stopCurrentTaskFromMenu {
+    [self terminateCurrentTaskQuietly];
+    [self showNotificationAlert:@"Đã dừng" title:@"Đã Dừng"];
+}
+
+- (void)showMenuHintOnce {
+    static BOOL shown = NO;
+    if (shown) return;
+    shown = YES;
+    NSString *hint = @"Chạm 3 ngón 2 lần để mở menu";
+    [self updateStatusHUD:hint];
+    VSDispatchAfterMS(3500, ^{
+        if (!self.currentTaskName && [self.statusHUDLabel.text isEqualToString:hint]) [self updateStatusHUD:nil];
+    });
 }
 
 - (NSUInteger)startNewTaskWithDescription:(NSString *)name initialStatus:(NSString *)status {
@@ -1662,10 +1897,8 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
     g_lastCapturedAdd = nil;
     g_chosenMediaKey = nil;
     g_taskActive = YES;
-    VSLogRunStart(name);
     VSApplySettingsToRun();
     self.currentTaskName = name;
-    self.floatingButton.alpha = 0.55;
     [self updateStatusHUD:status];
     return g_runIdentifier;
 }
@@ -1696,7 +1929,6 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
     self.multiSceneActiveCapturingIndex = -1;
     self.qrCaptureProxy = nil;
     self.currentTaskName = nil;
-    self.floatingButton.alpha = 1.0;
     [self updateStatusHUD:nil];
 }
 
@@ -1710,42 +1942,12 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 // Thông báo cuối mỗi lần chạy: luôn kèm nút "Xem log" + số dòng cảnh báo/lỗi.
 - (void)showRunResultAlert:(NSString *)msg title:(NSString *)title {
     [self updateStatusHUD:nil];
-    VSLogWriteFile();
-    NSUInteger errs = VSLogErrorCountLastRun();
-    NSString *full = errs ? [msg stringByAppendingFormat:@"\n\n⚠️ %lu dòng cảnh báo/lỗi trong log", (unsigned long)errs] : msg;
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:title ?: @"VideoStarTool" message:full preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"Xem log" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { [self presentLogViewer]; }]];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:title ?: @"VideoStarTool" message:msg preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
-    [[self topPresenterVC] presentViewController:a animated:YES completion:nil];
+    [self presentFromTop:a];
 }
 
-- (void)presentLogViewer {
-    VSToolLogViewController *vc = [VSToolLogViewController new];
-    vc.modalPresentationStyle = UIModalPresentationFullScreen;
-    [[self topPresenterVC] presentViewController:vc animated:YES completion:nil];
-}
 
-- (void)showDebugSettings {
-    NSArray *items = @[
-        @[kVSSetSuppressMenu, @"Chặn hẳn menu chọn lớp (hook)", @NO],
-        @[kVSSetSkipReselect, @"Bỏ qua chọn lại lớp đang chọn", @NO],
-        @[kVSSetDismissMenu,  @"Tự đóng menu chọn lớp", @YES],
-        @[kVSSetGuardCancel,  @"Chặn Hủy/Đóng do code", @YES]];
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Cài đặt gỡ lỗi" message:@"Bấm để bật/tắt, áp dụng từ lần chạy sau" preferredStyle:UIAlertControllerStyleActionSheet];
-    for (NSArray *item in items) {
-        BOOL on = VSSettingBool(item[0], [item[2] boolValue]);
-        NSString *title = [NSString stringWithFormat:@"%@: %@", item[1], on ? @"BẬT" : @"TẮT"];
-        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
-            VSSettingSet(item[0], !on);
-            [self showDebugSettings];
-        }]];
-    }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Xoá toàn bộ log" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) { VSLogClear(); }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
-    sheet.popoverPresentationController.sourceView = self.floatingButton;
-    sheet.popoverPresentationController.sourceRect = self.floatingButton.bounds;
-    [[self topPresenterVC] presentViewController:sheet animated:YES completion:nil];
-}
 
 // ============================================================================
 // PHẦN 9: FEATURE 1 — Auto replace layers
@@ -1970,7 +2172,7 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
                         NSString *beforeSignature = before.signature ?: @"";
                         VSLogState([NSString stringWithFormat:@"lớp %lu trước replay", (unsigned long)(n + 1)], editorVC);
 
-                        BOOL fired = useCapture ? VSReplayCapturedAddOnEditor(editorVC, response)
+                        BOOL fired = useCapture ? (VSCapturedAddFilesExist(response) && VSReplayCapturedAddOnEditor(editorVC, response))
                                                 : VSReplayClipPickerResponseOnEditor(editorVC, response);
                         if (!fired) {
                             VSLog(@"❌ layer %lu: replay fail", (unsigned long)n);
@@ -2055,7 +2257,7 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
             if (t == 0) [msg appendString:@"Xong lớp đầu, không còn lớp video/ảnh nào khác"];
             else [msg appendFormat:@"Xong lớp đầu + %lu/%lu lớp còn lại", (unsigned long)c, (unsigned long)t];
             if (f) [msg appendFormat:@" (%lu lớp lỗi)", (unsigned long)f];
-            if (unconfirmed) [msg appendFormat:@"\n⚠️ %lu lớp chưa xác nhận được — kiểm tra lại / xem log", (unsigned long)unconfirmed];
+            if (unconfirmed) [msg appendFormat:@"\n⚠️ %lu lớp chưa xác nhận được — kiểm tra lại trong Video Star", (unsigned long)unconfirmed];
             if (blocked) [msg appendString:@"\nDừng vì popup mua Pro"];
             [self finalizeTaskWithMessage:msg];
         }];
@@ -2073,7 +2275,7 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
     VSToolQRCodePreviewVC *vc = [VSToolQRCodePreviewVC new];
     vc.qrImage = img;
     vc.modalPresentationStyle = UIModalPresentationFullScreen;
-    [[self topPresenterVC] presentViewController:vc animated:YES completion:nil];
+    [self presentFromTop:vc];
 }
 
 // ============================================================================
@@ -2239,7 +2441,7 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
         t.textColor = UIColor.whiteColor; t.font = [UIFont boldSystemFontOfSize:15];
         UILabel *s = [[UILabel alloc] initWithFrame:CGRectMake(14, 33, row.bounds.size.width - 140, 16)];
         s.text = has ? @"Đã nhận" : @"Chưa nhập";
-        s.textColor = has ? VSToolCyanColor() : [UIColor colorWithWhite:0.6 alpha:1.0];
+        s.textColor = has ? VSToolAccentColor() : [UIColor colorWithWhite:0.6 alpha:1.0];
         s.font = [UIFont systemFontOfSize:11];
         UIButton *b = VSToolCreateOutlineButton(has ? @"Đổi code" : @"Nhập code", CGRectMake(row.bounds.size.width - 112, 12, 100, 36));
         b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
@@ -2353,7 +2555,7 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
         VSLog(@"[Finish] vc=%@ mem=%.0fMB", VSDescribeVCChain(), VSAvailableMemoryMB());
         [self terminateCurrentTaskQuietly];
         NSMutableString *msg = [NSMutableString stringWithFormat:@"Xong %lu/%lu scene", (unsigned long)okCount, (unsigned long)total];
-        if (unconfirmedTotal) [msg appendFormat:@"\n⚠️ %lu lớp chưa xác nhận được media — kiểm tra lại / xem log", (unsigned long)unconfirmedTotal];
+        if (unconfirmedTotal) [msg appendFormat:@"\n⚠️ %lu lớp chưa xác nhận được media — kiểm tra lại trong Video Star", (unsigned long)unconfirmedTotal];
         NSString *fullMsg = err ? [err stringByAppendingFormat:@"\n%@", msg] : msg;
         VSLog(@"KẾT QUẢ: %@", fullMsg);
         [self showRunResultAlert:fullMsg title:err ? @"Dừng" : @"Thành công"];
