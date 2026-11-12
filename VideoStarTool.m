@@ -16,9 +16,8 @@
 //   2. Lớp đầu tiên dùng bảng chọn media của app (pickNewContent)
 //      - CN1: chỉ mở bảng chọn + thay media, KHÔNG tự bấm popup
 //      - CN4: nhập code -> mở bảng chọn (scene đầu) + thay media + tự bấm Trùng khớp / OK
-//   3. Các lớp tiếp theo chạy ngầm: bắt lời gọi confirmAddingLayer… của app lúc người dùng chọn media,
-//      rồi với mỗi lớp khác chọn lớp -> gọi lại confirmAddingLayer… (isAbleToShowTheLayerActionMenu:NO).
-//      Không bắt được -> tự quay về cách replay pickedWithClipPickerResponse: cũ.
+//   3. Các lớp còn lại: SAO CHÉP lớp nguồn (copyLayer:) sang từng lớp đã chọn, không nhập lại media.
+//      Chỉ khi chưa có lớp nguồn (ví dụ scene sau trong CN4) mới nhập 1 lần để làm lớp nguồn.
 //   4. CN2: xem QR gần nhất. CN3: tự chia beat.
 // ============================================================================
 
@@ -190,6 +189,22 @@ static VSCapturedAdd *g_lastCapturedAdd = nil;
 
 // File ảnh/video app nhận từ bảng chọn có thể đã bị xoá sau lần chọn đầu. Trước khi phát lại cho lớp khác,
 // kiểm tra các file còn tồn tại không; nếu mất thì bỏ qua lớp đó thay vì để app đọc file không có (dễ crash).
+// Sao chép lớp: gọi method copyLayer: của app (selector có trong Video Star, xem logic.m).
+// Giả định: lớp đang được chọn nhận bản sao của lớp `src` (chưa xác nhận đủ trên máy).
+// Không gọi nếu app không có method này, và bọc @try để không làm sập app.
+static BOOL VSCopyLayerOnEditor(id editorVC, NSUInteger src) {
+    SEL s = NSSelectorFromString(@"copyLayer:");
+    if (!editorVC || ![editorVC respondsToSelector:s]) return NO;
+    BOOL ok = NO;
+    @try {
+        ((void (*)(id, SEL, NSUInteger))objc_msgSend)(editorVC, s, src);
+        ok = YES;
+    } @catch (NSException *__unused e) {
+        ok = NO;
+    }
+    return ok;
+}
+
 static BOOL VSCapturedAddFilesExist(id cap) {
     if (![cap isKindOfClass:[VSCapturedAdd class]]) return YES;
     VSCapturedAdd *c = (VSCapturedAdd *)cap;
@@ -2113,6 +2128,8 @@ static UIView *VSMakeDivider(CGRect frame) {
         if (total == 0) { done(0, 0, 0, NO); return; }
 
         __block NSUInteger idx = 0, changed = 0, failed = 0;
+        // Lớp nguồn đã có media (lớp đầu do người dùng chọn). Các lớp khác được SAO CHÉP từ đây, không nhập lại.
+        __block NSInteger copySourceIdx = skipIndex;
         __block NSUInteger retriedLayer = NSNotFound;
         __block BOOL blockedPurchase = NO;
         __block void (^iterate)(void) = nil;
@@ -2174,8 +2191,16 @@ static UIView *VSMakeDivider(CGRect frame) {
                         NSString *beforeSignature = before.signature ?: @"";
                         VSLogState([NSString stringWithFormat:@"lớp %lu trước replay", (unsigned long)(n + 1)], editorVC);
 
-                        BOOL fired = useCapture ? (VSCapturedAddFilesExist(response) && VSReplayCapturedAddOnEditor(editorVC, response))
-                                                : VSReplayClipPickerResponseOnEditor(editorVC, response);
+                        BOOL fired = NO;
+                        if (copySourceIdx >= 0) {
+                            // Sao chép lớp nguồn sang lớp đang chọn (KHÔNG nhập lại media).
+                            fired = VSCopyLayerOnEditor(editorVC, (NSUInteger)copySourceIdx);
+                        } else {
+                            // Chỉ khi chưa có lớp nguồn: nhập media thật 1 lần, lớp này trở thành lớp nguồn.
+                            fired = useCapture ? (VSCapturedAddFilesExist(response) && VSReplayCapturedAddOnEditor(editorVC, response))
+                                               : VSReplayClipPickerResponseOnEditor(editorVC, response);
+                            if (fired) copySourceIdx = (NSInteger)n;
+                        }
                         if (!fired) {
                             VSLog(@"❌ layer %lu: replay fail", (unsigned long)n);
                             failed++; next(); return;
