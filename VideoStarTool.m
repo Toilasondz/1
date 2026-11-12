@@ -1295,8 +1295,8 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 // ============================================================================
 // PHẦN 8B: MENU SANG TRỌNG (mở / đóng bằng CHẠM 3 NGÓN 2 LẦN)
 // Nền mờ kính + thẻ vàng champagne trên nền đen. Không còn nút tròn.
-// Chọn chức năng dùng cử chỉ CHẠM 1 NGÓN gắn vào khung menu, xác định hàng theo vị trí chạm,
-// nên chạm 3 ngón (mở / đóng menu) không kích hoạt chức năng nào.
+// Các nút (Đóng, Dừng, Mở lại QR, 4 chức năng) là UIControl chuẩn: bấm là kích hoạt (target-action).
+// Chạm 3 ngón (mở / đóng menu) không kích hoạt nút nào: nút chỉ nhận khi đúng 1 ngón chạm vào khung.
 // ============================================================================
 
 static NSString *const kVSMenuGestureName = @"VSToolMenuGesture3x2";
@@ -1359,7 +1359,7 @@ static UIView *VSMakeDivider(CGRect frame) {
     return d;
 }
 
-// Hàng chức năng: chỉ hiệu ứng nhấn (không tự kích hoạt gì; việc kích hoạt do khung menu lo)
+// Hàng chức năng: chỉ hiệu ứng nhấn (việc kích hoạt do target-action của khung menu lo)
 @interface VSToolMenuRowControl : UIControl
 @end
 @implementation VSToolMenuRowControl
@@ -1379,20 +1379,19 @@ static UIView *VSMakeDivider(CGRect frame) {
 - (UIButton *)pillWithTitle:(NSString *)title color:(UIColor *)color frame:(CGRect)frame;
 - (VSToolMenuRowControl *)rowWithIndex:(NSInteger)index title:(NSString *)title subtitle:(NSString *)subtitle frame:(CGRect)frame;
 - (void)haptic;
-- (void)dimTapped:(UITapGestureRecognizer *)g;
-- (void)panelTapped:(UITapGestureRecognizer *)g;
+- (BOOL)isSingleTouchInArea:(UIView *)area forEvent:(UIEvent *)event;
+- (void)menuControlTapped:(UIControl *)sender forEvent:(UIEvent *)event;
+- (void)dimTapped:(UIControl *)sender forEvent:(UIEvent *)event;
 - (void)performActionWithTag:(NSInteger)tag;
 @end
 
 @implementation VSToolMenuView {
     UIView *_panel;
-    NSMutableArray<UIControl *> *_actionControls;   // các hàng / nút có thể chạm, tag = mã hành động
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (!self) return nil;
-    _actionControls = [NSMutableArray array];
     self.backgroundColor = UIColor.clearColor;
     self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
 
@@ -1402,12 +1401,10 @@ static UIView *VSMakeDivider(CGRect frame) {
     blur.userInteractionEnabled = NO;
     [self addSubview:blur];
 
-    UIView *dim = [[UIView alloc] initWithFrame:self.bounds];
+    UIControl *dim = [[UIControl alloc] initWithFrame:self.bounds];
     dim.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     dim.backgroundColor = [UIColor colorWithWhite:0 alpha:0.30];
-    UITapGestureRecognizer *dimTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(dimTapped:)];
-    dimTap.numberOfTouchesRequired = 1;
-    [dim addGestureRecognizer:dimTap];
+    [dim addTarget:self action:@selector(dimTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:dim];
 
     [self buildPanel];
@@ -1433,11 +1430,6 @@ static UIView *VSMakeDivider(CGRect frame) {
     _panel.layer.shadowOpacity = 0.7;
     _panel.layer.shadowRadius = 30.0;
     _panel.layer.shadowOffset = CGSizeMake(0, 18);
-    // Cử chỉ chạm 1 ngón trên khung: chạm 3 ngón không khớp nên không kích hoạt hàng nào
-    UITapGestureRecognizer *panelTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(panelTapped:)];
-    panelTap.numberOfTouchesRequired = 1;
-    panelTap.numberOfTapsRequired = 1;
-    [_panel addGestureRecognizer:panelTap];
     [self addSubview:_panel];
 
     UIFont *kickerFont = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
@@ -1479,8 +1471,8 @@ static UIView *VSMakeDivider(CGRect frame) {
         UIButton *stop = [self pillWithTitle:@"Dừng" color:[UIColor colorWithRed:1.0 green:0.56 blue:0.52 alpha:1.0]
                                        frame:CGRectMake(cw - 16 - 80, (cardH - 32) / 2.0, 80, 32)];
         stop.tag = kVSMenuTagStop;
+        [stop addTarget:self action:@selector(menuControlTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
         [card addSubview:stop];
-        [_actionControls addObject:stop];
     } else {
         cap.attributedText = VSLetterSpaced(@"SẴN SÀNG", 2.0, VSToolAccentColor(), capFont);
         UILabel *hint = VSMenuMakeLabel(CGRectMake(16, 27, cw - 32, 20), @"Chọn một chức năng bên dưới",
@@ -1494,8 +1486,8 @@ static UIView *VSMakeDivider(CGRect frame) {
         UIButton *reopen = [self pillWithTitle:@"Mở lại bảng QR" color:VSToolAccentColor() frame:CGRectMake(inner, y, cw, 40)];
         reopen.layer.cornerRadius = 14.0;
         reopen.tag = kVSMenuTagReopen;
+        [reopen addTarget:self action:@selector(menuControlTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
         [_panel addSubview:reopen];
-        [_actionControls addObject:reopen];
         y += 52.0;
     }
 
@@ -1510,8 +1502,8 @@ static UIView *VSMakeDivider(CGRect frame) {
     for (NSUInteger i = 0; i < items.count; i++) {
         VSToolMenuRowControl *row = [self rowWithIndex:(NSInteger)(i + 1) title:items[i][0] subtitle:items[i][1]
                                                  frame:CGRectMake(inner, y, cw, rowH)];
+        [row addTarget:self action:@selector(menuControlTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
         [_panel addSubview:row];
-        [_actionControls addObject:row];
         y += rowH + gap;
     }
     y += 4.0;
@@ -1526,8 +1518,8 @@ static UIView *VSMakeDivider(CGRect frame) {
     [close setTitleColor:VSToolAccentColor() forState:UIControlStateNormal];
     close.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
     close.tag = kVSMenuTagClose;
+    [close addTarget:self action:@selector(menuControlTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
     [_panel addSubview:close];
-    [_actionControls addObject:close];
     y += 44.0 + 22.0;
 
     // Hoàn tất khung: kích thước thật, nền gradient, bóng
@@ -1625,21 +1617,23 @@ static UIView *VSMakeDivider(CGRect frame) {
     }
 }
 
-// Chạm trên khung menu: xác định hàng / nút nào nằm dưới điểm chạm, rồi thực hiện hành động.
-- (void)panelTapped:(UITapGestureRecognizer *)g {
-    if (g.state != UIGestureRecognizerStateRecognized) return;
-    if ([VSTool shared].menuView != self) return;          // menu đang đóng: bỏ qua chạm trùng
-    CGPoint p = [g locationInView:_panel];
-    for (UIControl *c in _actionControls) {
-        if (![c pointInside:[c convertPoint:p fromView:_panel] withEvent:nil]) continue;
-        [self performActionWithTag:c.tag];
-        return;
+// Đếm số ngón đang chạm trong vùng 'area'. Chỉ kích hoạt khi có đúng 1 ngón (chạm 3 ngón để mở/đóng menu thì bỏ qua).
+- (BOOL)isSingleTouchInArea:(UIView *)area forEvent:(UIEvent *)event {
+    NSUInteger n = 0;
+    for (UITouch *t in event.allTouches) {
+        if (t.view && [t.view isDescendantOfView:area]) n++;
     }
+    return n <= 1;
 }
 
-// Chạm vùng nền ngoài khung: đóng menu.
-- (void)dimTapped:(UITapGestureRecognizer *)g {
-    if (g.state != UIGestureRecognizerStateRecognized) return;
+- (void)menuControlTapped:(UIControl *)sender forEvent:(UIEvent *)event {
+    if (![self isSingleTouchInArea:_panel forEvent:event]) return;
+    if ([VSTool shared].menuView != self) return;      // menu đang đóng: bỏ qua chạm trùng
+    [self performActionWithTag:sender.tag];
+}
+
+- (void)dimTapped:(UIControl *)sender forEvent:(UIEvent *)event {
+    if (![self isSingleTouchInArea:self forEvent:event]) return;   // 3 ngón: để cử chỉ 3 ngón xử lý
     if ([VSTool shared].menuView != self) return;
     [[VSTool shared] hideMenuWithCompletion:nil];
 }
