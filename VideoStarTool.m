@@ -1,23 +1,19 @@
 // ============================================================================
-// VideoStarTool.m — Video Star 14.3.3 (build 1809) — v5
+// VideoStarTool.m — Video Star 14.3.3 (build 1809) — v5.1
 //
-// THAY ĐỔI v5 (so với v4):
-//   [FIX CHÍ MẠNG] Sửa signature 2 hook confirmAddingLayer:...
-//                  imp_implementationWithBlock KHÔNG truyền _cmd vào block.
-//                  Block signature = (self, arg1, arg2, ...). Tham số #2 phải là id (layer),
-//                  KHÔNG phải SEL. Code v4 dùng SEL makeSel → sai strict aliasing → app hỏng
-//                  state layer → crash khi nhập xong tất cả op.
-//   [FIX] VSEditorIsBusy: thêm check alpha > 0.01 để tránh false positive spinner.
-//   [FIX] finishWithStop: bọc @try quanh callback + log chẩn đoán.
-//   [FIX] executeFeature1ReplaceLayers: delay 800ms (thay 400ms) trước finalize,
-//         để app kịp finalize layer cuối; check runId lần 2 trong block delay.
-//   [FIX] importNewPreset / importOldPreset: giữ nguyên (đã đúng chuẩn).
+// v5.1 (fix build):
+//   - Thêm định nghĩa VSAbortActiveTask (trước chỉ forward-declare static →
+//     lỗi -Werror,-Wundefined-internal). Đặt cuối file vì cần truy cập các
+//     static global khai báo ở phần UTILITIES và @interface VSTool.
+//   - Đánh dấu __attribute__((unused)) cho VSNumActiveLayers,
+//     VSFindCreateButtonOnEditor, VSHasAnyActivePopup (phòng -Wunused-function).
 //
-// GIỮ NGUYÊN từ v4:
-//   - Nhập media theo VSAuto (pickNewContent -> chờ confirm/đổi signature -> copyLayer:).
-//   - Cờ huỷ không bị đặt sai khi picker đang mở.
-//   - Editor giữ yếu (weak). Mọi block main qua VSGuard.
-//   - Menu 3 ngón 2 lần, Mở lại QR, Auto chia beat, nhập code hàng loạt.
+// v5 (fix crash runtime):
+//   - Sửa signature hook confirmAddingLayer:... — imp_implementationWithBlock
+//     KHÔNG truyền _cmd; tham số #2 phải là id (layer), KHÔNG phải SEL.
+//   - VSEditorIsBusy: thêm check alpha > 0.01.
+//   - finishWithStop: bọc @try + log.
+//   - executeFeature1ReplaceLayers: delay 800ms trước finalize.
 // ============================================================================
 
 #import <UIKit/UIKit.h>
@@ -41,7 +37,7 @@ typedef void (^VSFillCompletion)(NSUInteger copied, NSUInteger targets, NSArray<
 // AN TOÀN
 // ============================================================================
 
-static void VSAbortActiveTask(NSString *reason);
+static void VSAbortActiveTask(NSString *reason);   // forward decl (định nghĩa ở cuối)
 
 static void VSGuard(void (^block)(void)) {
     @try { block(); }
@@ -50,6 +46,7 @@ static void VSGuard(void (^block)(void)) {
     }
 }
 
+static inline void VSRunOnMain(dispatch_block_t block) __attribute__((unused));
 static inline void VSRunOnMain(dispatch_block_t block) {
     if ([NSThread isMainThread]) { @autoreleasepool { VSGuard(block); } }
     else { dispatch_async(dispatch_get_main_queue(), ^{ @autoreleasepool { VSGuard(block); } }); }
@@ -268,6 +265,7 @@ static inline void VSSetQRDelegateSafely(id qrManager, id delegate) {
     @catch (NSException *__unused e) {}
 }
 
+static UIBarButtonItem *VSFindCreateButtonOnEditor(id editorVC) __attribute__((unused));
 static UIBarButtonItem *VSFindCreateButtonOnEditor(id editorVC) {
     if (!editorVC) return nil;
     NSArray *createKeywords = @[@"tạo", @"create", @"done", @"xong", @"save", @"lưu", @"export", @"xuất"];
@@ -353,6 +351,7 @@ static NSInteger VSLastSelectedLayer(id editor) {
     return n;
 }
 
+static NSInteger VSNumActiveLayers(id engine) __attribute__((unused));
 static NSInteger VSNumActiveLayers(id engine) {
     if (!engine) return 0;
     __block NSInteger n = 0;
@@ -530,7 +529,6 @@ static BOOL VSEditorIsBusy(id editorVC) {
     id spinner = VSSafeValueForKey(editorVC, @"spinner");
     if ([spinner isKindOfClass:[UIActivityIndicatorView class]]) {
         UIActivityIndicatorView *sp = (UIActivityIndicatorView *)spinner;
-        // FIX v5: check cả alpha > 0.01 để tránh false positive khi spinner trong suốt.
         if (sp.isAnimating && sp.window && !sp.hidden && sp.alpha > 0.01) return YES;
     }
     id alert = VSSafeValueForKey(editorVC, @"loadingAlert");
@@ -612,6 +610,7 @@ static VSPopupActionStatus VSResolvePopupsImmediately(id editorVC) {
     return anyHandled ? VSPopupActionStatusHandled : VSPopupActionStatusNone;
 }
 
+static BOOL VSHasAnyActivePopup(id editorVC) __attribute__((unused));
 static BOOL VSHasAnyActivePopup(id editorVC) {
     for (id popup in VSCollectAllVisiblePopups(editorVC)) {
         if (VSPopupIsLayerActionMenu(popup)) continue;
@@ -761,7 +760,7 @@ static IMP g_origConfirmOverwrite2 = NULL;
 static IMP g_origEditorMemWarn = NULL;
 static IMP g_origNavMemWarn = NULL;
 
-static NSUInteger g_presetImportEventCounter = 0;
+static NSUInteger g_presetImportEventCounter __attribute__((unused)) = 0;
 
 static BOOL VSRobustSwizzleMethod(NSString *className, SEL selector, id blockImpl, IMP *origImp) {
     Class cls = NSClassFromString(className);
@@ -845,11 +844,7 @@ static void VSInstallCoreHooksOnce(void) {
                 ((void (*)(id, SEL, id, BOOL, BOOL))g_origConfirmOverwrite2)(selfInstance, @selector(confirmOverwrite:isAbleToShowTheLayerActionMenu:removeOverlayBlending:), object, showMenu, removeOverlay);
         }, &g_origConfirmOverwrite2);
 
-        // ============================================================
-        // FIX v5 (CHÍ MẠNG): imp_implementationWithBlock KHÔNG truyền _cmd vào block.
-        // Block signature = (self, arg1, arg2, ...). Tham số #2 phải là id (layer),
-        // KHÔNG phải SEL. Code v4 dùng SEL makeSel → strict aliasing violation → crash.
-        // ============================================================
+        // FIX v5: imp_implementationWithBlock KHÔNG truyền _cmd; tham số #2 là id (layer).
         VSRobustSwizzleMethod(@"MultiLayerWizEffectVC",
             @selector(confirmAddingLayer:object:object2:object3:isAbleToShowTheLayerActionMenu:),
             ^(id selfInstance, id layer, id obj1, id obj2, id obj3, BOOL able) {
@@ -1464,7 +1459,6 @@ static VSLayerFiller *g_activeFiller = nil;
 }
 
 - (void)finishWithStop:(NSString *)reason {
-    // FIX v5: log + @try bọc callback để tránh crash nếu completion throw.
     NSLog(@"[VSFill] finishWithStop: reason=%@ copied=%lu finished=%d", reason, (unsigned long)self.copied, self.finished);
     if (self.finished) return;
     self.finished = YES;
@@ -1949,7 +1943,6 @@ static VSLayerFiller *g_activeFiller = nil;
     [VSLayerFiller fillLayers:layers editor:editor runId:runId completion:^(NSUInteger copied, NSUInteger targets, NSArray<NSNumber *> *unconfirmed, NSString *stop) {
         if (runId != g_runIdentifier) return;
         NSString *msg = VSFillSummary(copied, targets, unconfirmed, stop);
-        // FIX v5: delay 800ms để app kịp finalize layer cuối (texture upload, reload effect)
         VSDispatchAfterMS(800, ^{
             if (runId != g_runIdentifier) return;
             [self finalizeTaskWithMessage:msg];
@@ -2247,8 +2240,6 @@ static VSLayerFiller *g_activeFiller = nil;
 }
 
 - (void)executeBatchProcessingScenesWithRunId:(NSUInteger)runId {
-    // Placeholder — logic hàng loạt theo phân cảnh (mở editor, import preset, tạo scene)
-    // Phần này trong bản gốc dài hơn; ở đây giữ khung tối thiểu để build được.
     [self updateStatusHUD:@"Chức năng 4 đang phát triển"];
     VSDispatchAfterMS(800, ^{ [self finalizeTaskWithMessage:@"Chức năng 4 chưa hoàn chỉnh trong bản này"]; });
 }
@@ -2274,6 +2265,33 @@ static VSLayerFiller *g_activeFiller = nil;
 }
 
 @end
+
+// ============================================================================
+// VSAbortActiveTask — ĐỊNH NGHĨA (fix -Werror,-Wundefined-internal)
+// Đặt ở cuối file vì cần g_runIdentifier / g_onLayerAddedHandler / v.v.
+// khai báo trong phần UTILITIES và [VSTool shared] khai báo trong @interface.
+// ============================================================================
+
+static void VSAbortActiveTask(NSString *reason) {
+    NSLog(@"[VideoStarTool] VSAbortActiveTask: %@", reason);
+
+    // Vô hiệu hoá mọi task đang chờ (poll sẽ tự return NO ở vòng kế tiếp).
+    g_runIdentifier++;
+
+    // Reset cờ toàn cục để tool không kẹt ở trạng thái "đang chạy".
+    g_onLayerAddedHandler = nil;
+    g_vsaAutomating = NO;
+    g_suppressLayerActionMenu = NO;
+    g_autoConfirmPopups = NO;
+    g_dismissLayerMenu = NO;
+
+    // Dọn UI + state qua VSTool. Bọc @try để không đệ quy VSGuard.
+    @try {
+        [[VSTool shared] terminateCurrentTaskQuietly];
+    } @catch (NSException *e) {
+        NSLog(@"[VideoStarTool] VSAbortActiveTask cleanup threw: %@ %@", e.name, e.reason);
+    }
+}
 
 // ============================================================================
 // ENTRY POINT
