@@ -1689,9 +1689,11 @@ static NSString *VSDecodeQRRobust(UIImage *image) {
     return result;
 }
 
-@interface VSQRBatchPickerDelegate : NSObject <PHPickerViewControllerDelegate> API_AVAILABLE(ios(14.0))
+API_AVAILABLE(ios(14.0))
+@interface VSQRBatchPickerDelegate : NSObject <PHPickerViewControllerDelegate>
 @property (nonatomic, copy) void (^onPicked)(NSArray<PHPickerResult *> *results);
 @end
+API_AVAILABLE(ios(14.0))
 @implementation VSQRBatchPickerDelegate
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
