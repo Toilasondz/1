@@ -1,5 +1,5 @@
 // ============================================================================
-// VideoStarTool.m — Video Star 14.3.3 (build 1809) — v5 (FIXED)
+// VideoStarTool.m — Video Star 14.3.3 (build 1809) — v5
 //
 // THAY ĐỔI (v5 – Fix crash Chức năng 4):
 //   - XÓA hoàn toàn replayMode, replayAddOn:, g_savedAddArgs, g_savedAddIs5.
