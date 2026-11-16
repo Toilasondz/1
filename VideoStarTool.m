@@ -785,9 +785,14 @@ static BOOL VSRobustSwizzleMethod(NSString *className, SEL selector, id blockImp
     return YES;
 }
 
-static void VSNotifyLayerAdded(id sender, NSArray *args, BOOL is5, BOOL able) {
+// Tham số đầu tiên của confirmAddingLayer là SEL (không phải object): giữ dạng con trỏ thô,
+// tuyệt đối không đưa vào NSArray (retain lên con trỏ không hợp lệ sẽ crash).
+static void VSNotifyLayerAdded(id sender, const void *layerPtr, id o1, id o2, id o3, BOOL is5, BOOL able) {
     void (^handler)(id, NSArray *, BOOL, BOOL) = g_onLayerAddedHandler;
-    if (handler) VSGuard(^{ handler(sender, args, is5, able); });
+    if (!handler) return;
+    NSArray *args = @[ [NSValue valueWithPointer:layerPtr],
+                       o1 ?: [NSNull null], o2 ?: [NSNull null], o3 ?: [NSNull null] ];
+    VSGuard(^{ handler(sender, args, is5, able); });
 }
 
 static void VSInstallCoreHooksOnce(void) {
@@ -857,13 +862,13 @@ static void VSInstallCoreHooksOnce(void) {
         VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(confirmAddingLayer:object:object2:object3:isAbleToShowTheLayerActionMenu:), ^(id selfInstance, id layer, id o1, id o2, id o3, BOOL able) {
             if (g_origConfirmAdd5)
                 ((void (*)(id, SEL, id, id, id, id, BOOL))g_origConfirmAdd5)(selfInstance, @selector(confirmAddingLayer:object:object2:object3:isAbleToShowTheLayerActionMenu:), layer, o1, o2, o3, able);
-            VSNotifyLayerAdded(selfInstance, @[layer ?: [NSNull null], o1 ?: [NSNull null], o2 ?: [NSNull null], o3 ?: [NSNull null]], YES, able);
+            VSNotifyLayerAdded(selfInstance, (__bridge const void *)layer, o1, o2, o3, YES, able);
         }, &g_origConfirmAdd5);
 
         VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(confirmAddingLayer:object:object2:object3:), ^(id selfInstance, id layer, id o1, id o2, id o3) {
             if (g_origConfirmAdd4)
                 ((void (*)(id, SEL, id, id, id, id))g_origConfirmAdd4)(selfInstance, @selector(confirmAddingLayer:object:object2:object3:), layer, o1, o2, o3);
-            VSNotifyLayerAdded(selfInstance, @[layer ?: [NSNull null], o1 ?: [NSNull null], o2 ?: [NSNull null], o3 ?: [NSNull null]], NO, NO);
+            VSNotifyLayerAdded(selfInstance, (__bridge const void *)layer, o1, o2, o3, NO, NO);
         }, &g_origConfirmAdd4);
 
         VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(didReceiveMemoryWarning), ^(id selfInstance) {
@@ -1555,7 +1560,7 @@ static VSLayerFiller *g_activeFiller = nil;
 - (BOOL)replayAddOn:(id)ed {
     NSArray *a = g_savedAddArgs;
     if (a.count < 4) return NO;
-    id l = (a[0] == [NSNull null]) ? nil : a[0];
+    id l = (__bridge id)[(NSValue *)a[0] pointerValue];
     id o1 = (a[1] == [NSNull null]) ? nil : a[1];
     id o2 = (a[2] == [NSNull null]) ? nil : a[2];
     id o3 = (a[3] == [NSNull null]) ? nil : a[3];
