@@ -857,13 +857,13 @@ static void VSInstallCoreHooksOnce(void) {
         VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(confirmAddingLayer:object:object2:object3:isAbleToShowTheLayerActionMenu:), ^(id selfInstance, id layer, id o1, id o2, id o3, BOOL able) {
             if (g_origConfirmAdd5)
                 ((void (*)(id, SEL, id, id, id, id, BOOL))g_origConfirmAdd5)(selfInstance, @selector(confirmAddingLayer:object:object2:object3:isAbleToShowTheLayerActionMenu:), layer, o1, o2, o3, able);
-            VSNotifyLayerAdded(selfInstance, @[layer ?: [NSNull null], obj1 ?: [NSNull null], obj2 ?: [NSNull null], obj3 ?: [NSNull null]], YES, able);
+            VSNotifyLayerAdded(selfInstance, @[layer ?: [NSNull null], o1 ?: [NSNull null], o2 ?: [NSNull null], o3 ?: [NSNull null]], YES, able);
         }, &g_origConfirmAdd5);
 
         VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(confirmAddingLayer:object:object2:object3:), ^(id selfInstance, id layer, id o1, id o2, id o3) {
             if (g_origConfirmAdd4)
                 ((void (*)(id, SEL, id, id, id, id))g_origConfirmAdd4)(selfInstance, @selector(confirmAddingLayer:object:object2:object3:), layer, o1, o2, o3);
-            VSNotifyLayerAdded(selfInstance, @[layer ?: [NSNull null], obj1 ?: [NSNull null], obj2 ?: [NSNull null], obj3 ?: [NSNull null]], NO, NO);
+            VSNotifyLayerAdded(selfInstance, @[layer ?: [NSNull null], o1 ?: [NSNull null], o2 ?: [NSNull null], o3 ?: [NSNull null]], NO, NO);
         }, &g_origConfirmAdd4);
 
         VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(didReceiveMemoryWarning), ^(id selfInstance) {
