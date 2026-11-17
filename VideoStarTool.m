@@ -1,22 +1,19 @@
 // ============================================================================
-// VideoStarTool.m — Video Star 14.3.3 (build 1809) — v7 (ULTRA FAST & ZERO CRASH)
+// VideoStarTool.m — Video Star 14.3.3 (build 1809) — v4
 //
-// ĐÃ SỬA VÀ TỐI ƯU HOÀN TOÀN:
-//   1. KHẮC PHỤC TRIỆT ĐỂ LỖI VĂNG APP (CRASH) KHI BẬT CHỨC NĂNG 1 VÀ 4:
-//      - Loại bỏ toàn bộ hook pickedWithClipPickerResponse và các tham số không an toàn.
-//      - Giữ nguyên cấu trúc hook ổn định chuẩn 100% của v5.
-//      - Đảm bảo delay chuyển cảnh và mở picker an toàn tuyệt đối, không xung đột UIKit.
-//   2. CHỨC NĂNG 4 SIÊU TỐC (~20 GIÂY / 10 PHÂN CẢNH):
-//      - Phân cảnh đầu tiên: Người dùng chọn 1 ảnh duy nhất.
-//      - TẤT CẢ các phân cảnh tiếp theo: TỰ ĐỘNG áp dụng trực tiếp ảnh đã chọn qua
-//        makePhotoLayer: và overwrite:, KHÔNG MỞ LẠI BẢNG CHỌN ẢNH NỮA!
-//      - Tự động sao chép sang toàn bộ các lớp còn lại bằng copyLayer:.
-//      - Tự động bấm Tạo và chuyển tiếp sang phân cảnh tiếp theo ngay lập tức.
-//   3. FIX LỖI KHI HOÀN TẤT CHỨC NĂNG 4:
-//      - Không dùng UIAlertController khi kết thúc (tránh xung đột dismiss modal gây văng app).
-//      - Hiển thị Card thông báo nổi trang trọng: "🎉 ĐÃ NHẬP XONG X/Y PHÂN CẢNH THÀNH CÔNG!"
-//      - Kèm nút "Xong / Đóng" và cập nhật trực tiếp trên thanh trạng thái (HUD).
+// THAY ĐỔI (v4):
+//   - Bỏ hoàn toàn logic nhập media cũ: replay pickedWithClipPickerResponse:,
+//     replay confirmAddingLayer:, hook cancelClipPicker. Đây là nguồn crash khi nhập lớp.
+//   - Nhập ảnh/video theo VSAuto (zkii): chọn lớp nguồn -> pickNewContent ->
+//     chờ xác nhận / đổi nội dung -> copyLayer: sang từng lớp còn lại.
+//   - Khi tool chạy: chặn hộp thoại ghi đè và menu hành động của lớp (như VSAuto).
+//   - Nhận diện thay đổi bằng chữ ký ổn định (URL asset, texture id, info), không dùng
+//     con trỏ đối tượng và không đọc layerImage khi poll.
+//   - Sửa lỗi của VSAuto: cờ "huỷ" không còn bị đặt sai khi picker đang mở.
+//   - Editor luôn giữ yếu (weak). Mọi block chạy trên main đều đi qua VSGuard.
+//   - Giữ nguyên: menu 3 ngón 2 lần, Mở lại QR, Auto chia beat, nhập code hàng loạt.
 // ============================================================================
+
 #import <UIKit/UIKit.h>
 #import <PhotosUI/PhotosUI.h>
 #import <AVFoundation/AVFoundation.h>
@@ -167,18 +164,16 @@ static BOOL VSMemoryHealthy(void) {
 // ============================================================================
 
 static NSUInteger g_runIdentifier = 0;
-static BOOL g_autoConfirmPopups = NO;
+static BOOL g_autoConfirmPopups = NO;            // chỉ bật trong Chức năng 4
 static BOOL g_suppressLayerActionMenu = NO;
 static BOOL g_createInProgress = NO;
 static BOOL g_dismissLayerMenu = NO;
-static BOOL g_vsaAutomating = NO;
+static BOOL g_vsaAutomating = NO;                // đang nhập media: chặn overwrite / menu lớp
 static const void *kVSMenuDismissedKey = &kVSMenuDismissedKey;
 static const void *kVSPopupHandledKey = &kVSPopupHandledKey;
 static NSHashTable *g_activePopupsTable = nil;
 static UIWindow *g_overlayToolWindow = nil;
 static void (^g_onLayerAddedHandler)(id sender, NSArray *args, BOOL is5, BOOL able) = nil;
-
-// v5: XÓA g_savedAddArgs, g_savedAddIs5 – nguồn crash replayMode
 static IMP g_origConfirmAdd4 = NULL;
 static IMP g_origConfirmAdd5 = NULL;
 
@@ -339,7 +334,7 @@ static void VSSafePollEditor(NSUInteger runId, int64_t intervalMs, NSUInteger re
     });
 }
 
-// Chờ bộ nhớ hồi phục trước khi chép.
+// Chờ bộ nhớ hồi phục trước khi chép. ok = NO nếu hết kiên nhẫn hoặc tác vụ đã dừng.
 static void VSWaitForMemory(NSUInteger runId, void (^done)(BOOL ok)) {
     VSSafePoll(runId, 400, 25, ^BOOL{ return VSMemoryHealthy(); }, ^(BOOL ok) { done(ok); });
 }
@@ -625,6 +620,7 @@ static BOOL VSHasAnyActivePopup(id editorVC) {
     return NO;
 }
 
+// Popup mua Pro đang hiện: luôn dừng tác vụ, không tự bấm.
 static BOOL VSPurchasePopupVisible(id editorVC) {
     for (id popup in VSCollectAllVisiblePopups(editorVC)) {
         if (VSPopupIsLayerActionMenu(popup)) continue;
@@ -650,7 +646,7 @@ static BOOL VSLayerFlag(id engine, SEL sel, NSUInteger n) {
     @catch (NSException *__unused e) { return NO; }
 }
 
-// Chữ ký ổn định: URL asset + texture id + thông tin gốc. Không đọc layerImage.
+// Chữ ký ổn định của lớp: URL asset + texture id + thông tin gốc. Không đọc layerImage (nặng).
 static NSString *VSLayerSignature(id engine, NSUInteger n) {
     if (!engine) return nil;
     __block NSString *sig = nil;
@@ -670,7 +666,7 @@ static NSString *VSLayerSignature(id engine, NSUInteger n) {
     return sig;
 }
 
-// Lớp có thể thay media.
+// Lớp có thể thay media: Video (1) hoặc Photo (4), không phải 3D/Text/Null/GIF/Overlay/Zaps/Particle/Drawing.
 static NSArray<NSNumber *> *VSDetectFillableLayers(id engine, BOOL includeEmpty) {
     NSMutableArray<NSNumber *> *out = [NSMutableArray array];
     if (!engine) return out;
@@ -697,7 +693,7 @@ static NSArray<NSNumber *> *VSDetectFillableLayers(id engine, BOOL includeEmpty)
     return out;
 }
 
-// copyLayer: như VSAuto.
+// copyLayer: như VSAuto (gọi trên editor). Nếu editor không có, thử trên engine.
 static BOOL VSFireCopyLayer(id editor, id engine, NSUInteger src) {
     SEL s = NSSelectorFromString(@"copyLayer:");
     id receiver = nil;
@@ -709,6 +705,7 @@ static BOOL VSFireCopyLayer(id editor, id engine, NSUInteger src) {
         return YES;
     } @catch (NSException *__unused e) { return NO; }
 }
+
 
 // ============================================================================
 // QR STORAGE
@@ -764,7 +761,6 @@ static IMP g_origCustomPopupDidMove = NULL;
 static IMP g_origShowLayerActionMenu = NULL;
 static IMP g_origShowImportConfirmation = NULL;
 static IMP g_origConfirmOverwrite1 = NULL;
-static UIImage *g_savedMultiSceneImage = nil;
 static IMP g_origConfirmOverwrite2 = NULL;
 static IMP g_origEditorMemWarn = NULL;
 static IMP g_origNavMemWarn = NULL;
@@ -786,13 +782,14 @@ static BOOL VSRobustSwizzleMethod(NSString *className, SEL selector, id blockImp
     return YES;
 }
 
-// v5: VSNotifyLayerAdded – chỉ thông báo, KHÔNG lưu con trỏ thô.
-// Chỉ đặt cờ pickerConfirmed trên filler. Không dùng NSValue+pointer.
-static void VSNotifyLayerAdded(id sender, BOOL is5, BOOL able) {
+// Tham số đầu tiên của confirmAddingLayer là SEL (không phải object): giữ dạng con trỏ thô,
+// tuyệt đối không đưa vào NSArray (retain lên con trỏ không hợp lệ sẽ crash).
+static void VSNotifyLayerAdded(id sender, const void *layerPtr, id o1, id o2, id o3, BOOL is5, BOOL able) {
     void (^handler)(id, NSArray *, BOOL, BOOL) = g_onLayerAddedHandler;
     if (!handler) return;
-    // v5: truyền mảng rỗng thay vì lưu con trỏ thô – tránh crash
-    VSGuard(^{ handler(sender, @[], is5, able); });
+    NSArray *args = @[ [NSValue valueWithPointer:layerPtr],
+                       o1 ?: [NSNull null], o2 ?: [NSNull null], o3 ?: [NSNull null] ];
+    VSGuard(^{ handler(sender, args, is5, able); });
 }
 
 static void VSInstallCoreHooksOnce(void) {
@@ -832,6 +829,7 @@ static void VSInstallCoreHooksOnce(void) {
                 ((void (*)(id, SEL, NSUInteger, BOOL))g_origShowLayerActionMenu)(selfInstance, @selector(showLayerActionMenu:newLayer:), layerNum, isNewLayer);
         }, &g_origShowLayerActionMenu);
 
+        // Hộp thoại "ghi đè?" bị chặn khi tool đang nhập media (như VSAuto).
         VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(showImportConfirmation), ^BOOL(id selfInstance) {
             if (g_vsaAutomating) return NO;
             if (g_origShowImportConfirmation)
@@ -857,19 +855,17 @@ static void VSInstallCoreHooksOnce(void) {
                 ((void (*)(id, SEL, id, BOOL, BOOL))g_origConfirmOverwrite2)(selfInstance, @selector(confirmOverwrite:isAbleToShowTheLayerActionMenu:removeOverlayBlending:), object, showMenu, removeOverlay);
         }, &g_origConfirmOverwrite2);
 
-        // v5: Hook confirmAddingLayer – CHỈ đặt cờ, KHÔNG lưu con trỏ thô.
+        // Chỉ quan sát: báo cho filler biết lớp đã nhận media mới.
         VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(confirmAddingLayer:object:object2:object3:isAbleToShowTheLayerActionMenu:), ^(id selfInstance, id layer, id o1, id o2, id o3, BOOL able) {
             if (g_origConfirmAdd5)
                 ((void (*)(id, SEL, id, id, id, id, BOOL))g_origConfirmAdd5)(selfInstance, @selector(confirmAddingLayer:object:object2:object3:isAbleToShowTheLayerActionMenu:), layer, o1, o2, o3, able);
-            // v5: không truyền con trỏ layer vào handler
-            VSNotifyLayerAdded(selfInstance, YES, able);
+            VSNotifyLayerAdded(selfInstance, (__bridge const void *)layer, o1, o2, o3, YES, able);
         }, &g_origConfirmAdd5);
 
         VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(confirmAddingLayer:object:object2:object3:), ^(id selfInstance, id layer, id o1, id o2, id o3) {
             if (g_origConfirmAdd4)
                 ((void (*)(id, SEL, id, id, id, id))g_origConfirmAdd4)(selfInstance, @selector(confirmAddingLayer:object:object2:object3:), layer, o1, o2, o3);
-            // v5: không truyền con trỏ layer vào handler
-            VSNotifyLayerAdded(selfInstance, NO, NO);
+            VSNotifyLayerAdded(selfInstance, (__bridge const void *)layer, o1, o2, o3, NO, NO);
         }, &g_origConfirmAdd4);
 
         VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(didReceiveMemoryWarning), ^(id selfInstance) {
@@ -985,7 +981,6 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 }
 @end
 
-
 // ============================================================================
 // VSTOOL INTERFACE
 // ============================================================================
@@ -1007,7 +1002,6 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 @property (nonatomic, assign) NSUInteger multiSceneRunId;
 @property (nonatomic, assign) NSInteger multiSceneActiveCapturingIndex;
 @property (nonatomic, strong) UIView *multiSceneCardView;
-@property (nonatomic, strong) UIView *completionCardView;
 @property (nonatomic, copy)   NSString *currentTaskName;
 @property (nonatomic, strong) id savedOriginalQRDelegate;
 @property (nonatomic, assign) BOOL savedOriginalQRDelegateValid;
@@ -1039,8 +1033,7 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 - (void)handleBottomBarCancel;
 - (NSUInteger)startNewTaskWithDescription:(NSString *)taskName initialStatus:(NSString *)initialStatus;
 - (void)finalizeTaskWithMessage:(NSString *)msg;
-- (void)showCompletionCardWithMessage:(NSString *)msg isSuccess:(BOOL)isSuccess;
-- (void)dismissCompletionCard;
+- (void)showRunResultAlert:(NSString *)msg title:(NSString *)title;
 - (void)executeFeature1ReplaceLayers;
 - (void)executeFeature2DisplayLastCode;
 - (void)executeFeature3AutoSplitBeat;
@@ -1409,9 +1402,7 @@ static UIView *VSMakeDivider(CGRect frame) {
 @end
 
 // ============================================================================
-// NHẬP MEDIA THEO VSAUTO (v5 – ĐÃ SỬA CRASH)
-// Không còn replayMode / replayAddOn: / g_savedAddArgs.
-// Luôn mở picker mới cho mỗi lần nhập.
+// NHẬP MEDIA THEO VSAUTO: chọn lớp nguồn -> pickNewContent -> copyLayer: sang các lớp còn lại
 // ============================================================================
 
 static NSString *VSFillSummary(NSUInteger copied, NSUInteger targets, NSArray<NSNumber *> *unconfirmed, NSString *stop) {
@@ -1439,9 +1430,10 @@ static NSString *VSFillSummary(NSUInteger copied, NSUInteger targets, NSArray<NS
 @property (nonatomic, assign) BOOL pickerSeenOpen;
 @property (nonatomic, assign) BOOL pickerConfirmed;
 @property (nonatomic, assign) CFAbsoluteTime pickerClosedAt;
-@property (nonatomic, assign) NSInteger pickOutcome; // 0 chờ, 1 đã chọn, 2 huỷ, 3 popup Pro
-// v5: XÓA requirePickerOpen, replayMode
+@property (nonatomic, assign) NSInteger pickOutcome;   // 0 chờ, 1 đã chọn, 2 huỷ, 3 popup Pro
+@property (nonatomic, assign) BOOL requirePickerOpen;   // chỉ chấp nhận thay đổi sau khi bảng chọn đã mở
 + (void)fillLayers:(NSArray<NSNumber *> *)layers editor:(id)editor runId:(NSUInteger)runId completion:(VSFillCompletion)completion;
++ (void)fillLayers:(NSArray<NSNumber *> *)layers editor:(id)editor runId:(NSUInteger)runId requirePickerOpen:(BOOL)requirePicker completion:(VSFillCompletion)completion;
 @end
 
 static VSLayerFiller *g_activeFiller = nil;
@@ -1449,6 +1441,10 @@ static VSLayerFiller *g_activeFiller = nil;
 @implementation VSLayerFiller
 
 + (void)fillLayers:(NSArray<NSNumber *> *)layers editor:(id)editor runId:(NSUInteger)runId completion:(VSFillCompletion)completion {
+    [self fillLayers:layers editor:editor runId:runId requirePickerOpen:NO completion:completion];
+}
+
++ (void)fillLayers:(NSArray<NSNumber *> *)layers editor:(id)editor runId:(NSUInteger)runId requirePickerOpen:(BOOL)requirePicker completion:(VSFillCompletion)completion {
     if (layers.count == 0) { if (completion) completion(0, 0, @[], @"Không có lớp để thay"); return; }
     VSLayerFiller *f = [VSLayerFiller new];
     f.editor = editor;
@@ -1458,7 +1454,7 @@ static VSLayerFiller *g_activeFiller = nil;
     f.unconfirmed = [NSMutableArray array];
     f.source = layers.firstObject.unsignedIntegerValue;
     f.nextIndex = 1;
-    // v5: không đặt requirePickerOpen / replayMode
+    f.requirePickerOpen = requirePicker;
     g_vsaAutomating = YES;
     g_suppressLayerActionMenu = YES;
     g_activeFiller = f;
@@ -1490,6 +1486,7 @@ static VSLayerFiller *g_activeFiller = nil;
     }
 }
 
+// Chọn lớp, chờ lastSelectedLayerNum khớp (nếu editor hỗ trợ).
 - (void)selectLayer:(NSUInteger)n then:(void (^)(BOOL ok))next {
     VSObjProvider p = [self provider];
     id ed = p();
@@ -1526,7 +1523,6 @@ static VSLayerFiller *g_activeFiller = nil;
     self.pickerClosedAt = 0;
     self.pickOutcome = 0;
 
-    // v5: handler chỉ đặt cờ, KHÔNG lưu con trỏ thô
     __weak VSLayerFiller *wSelf = self;
     g_onLayerAddedHandler = ^(id sender, NSArray *args, BOOL is5, BOOL able) {
         VSLayerFiller *s = wSelf;
@@ -1534,7 +1530,6 @@ static VSLayerFiller *g_activeFiller = nil;
         s.pickerConfirmed = YES;
     };
 
-    // v5: LUÔN mở picker mới – không replay
     BOOL opened = VSTry(^{ [ed pickNewContent]; });
     if (!opened) { [self finishWithStop:@"Không mở được bảng chọn media"]; return; }
 
@@ -1547,11 +1542,7 @@ static VSLayerFiller *g_activeFiller = nil;
 
 - (BOOL)pickConditionOn:(id)ed {
     UIViewController *vc = (UIViewController *)ed;
-    BOOL open = NO;
-    @try {
-        open = vc.presentedViewController != nil || vc.navigationController.presentedViewController != nil;
-    } @catch (NSException *__unused e) { open = NO; }
-    
+    BOOL open = vc.presentedViewController != nil || vc.navigationController.presentedViewController != nil;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (open) {
         self.pickerSeenOpen = YES;
@@ -1564,14 +1555,14 @@ static VSLayerFiller *g_activeFiller = nil;
     NSString *sig = VSLayerSignature(engine, self.source) ?: @"";
     BOOL changed = sig.length > 0 && ![sig isEqualToString:(self.beforeSignature ?: @"")];
     BOOL pickedSignal = self.pickerConfirmed || changed;
-
-    // v5: đơn giản hóa – chỉ cần tín hiệu đã chọn + asset loaded + không busy
-    if (pickedSignal && VSLayerAssetLoaded(engine, self.source) && !VSEditorIsBusy(ed)) {
+    BOOL pickerOK = !self.requirePickerOpen || self.pickerSeenOpen;
+    if (pickedSignal && pickerOK && VSLayerAssetLoaded(engine, self.source) && !VSEditorIsBusy(ed)) {
         self.pickOutcome = 1;
         return YES;
     }
     if (self.pickerSeenOpen) {
         if (self.pickerClosedAt == 0) self.pickerClosedAt = now;
+        // Picker đã đóng mà không có thay đổi: người dùng huỷ.
         if (now - self.pickerClosedAt > 2.5) { self.pickOutcome = 2; return YES; }
     }
     return NO;
@@ -1665,9 +1656,12 @@ static VSLayerFiller *g_activeFiller = nil;
 
 @end
 
+// ============================================================================
+// VSTOOL IMPLEMENTATION
+// ============================================================================
 
 // ============================================================================
-// ĐỌC QR TỪ ẢNH & BATCH PICKER
+// ĐỌC QR TỪ ẢNH: tự giải mã thay cho luồng startQRImport của app (tránh lỗi "(null)")
 // ============================================================================
 
 static NSString *VSFirstQRMessage(NSArray *features) {
@@ -1682,6 +1676,7 @@ static NSString *VSFirstQRMessage(NSArray *features) {
     return fallback;
 }
 
+// Thử nhiều tỉ lệ và tăng tương phản: mã QR nhỏ hoặc ảnh nén thường chỉ đọc được ở tỉ lệ khác.
 static NSString *VSDecodeQRRobust(UIImage *image) {
     if (!image) return nil;
     CIImage *base = [[CIImage alloc] initWithImage:image];
@@ -1723,8 +1718,10 @@ API_AVAILABLE(ios(14.0))
 }
 @end
 
+// Giữ delegate sống trong lúc picker đang mở.
 static id g_qrBatchPickerDelegate = nil;
 
+// Đọc ảnh theo đúng thứ tự đã chọn. Mục không đọc được là NSNull.
 static void VSLoadPickedImages(NSArray<PHPickerResult *> *results, void (^done)(NSArray *images)) API_AVAILABLE(ios(14.0)) {
     NSMutableArray *images = [NSMutableArray arrayWithCapacity:results.count];
     for (NSUInteger i = 0; i < results.count; i++) [images addObject:[NSNull null]];
@@ -1743,6 +1740,8 @@ static void VSLoadPickedImages(NSArray<PHPickerResult *> *results, void (^done)(
     dispatch_group_notify(group, dispatch_get_main_queue(), ^{ done([images copy]); });
 }
 
+// Nhập lần lượt từng code: giải mã ảnh, đưa vào app qua selectedCode:withImageData:
+// và chờ app trả preset qua delegate. Không cần bấm nút từng phân cảnh.
 static void VSImportBatchCodes(VSTool *tool, NSArray *images, NSUInteger runId) {
     __weak VSTool *wTool = tool;
     __block NSUInteger idx = 0;
@@ -1806,10 +1805,6 @@ static void VSImportBatchCodes(VSTool *tool, NSArray *images, NSUInteger runId) 
     };
     step();
 }
-
-// ============================================================================
-// VSTOOL IMPLEMENTATION CHI TIẾT
-// ============================================================================
 
 @implementation VSTool
 
@@ -1901,55 +1896,6 @@ static void VSImportBatchCodes(VSTool *tool, NSArray *images, NSUInteger runId) 
     [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
     [self presentFromTop:a];
 }
-
-// ============================================================================
-// THÔNG BÁO HOÀN TẤT AN TOÀN TUYỆT ĐỐI (KHÔNG BAO GIỜ CRASH / VĂNG APP)
-// ============================================================================
-
-- (void)showCompletionCardWithMessage:(NSString *)msg isSuccess:(BOOL)isSuccess {
-    [self dismissCompletionCard];
-    [self dismissBottomActionBar];
-    [self.multiSceneCardView removeFromSuperview];
-    self.multiSceneCardView = nil;
-
-    UIView *c = self.window.rootViewController.view;
-    if (!c) return;
-    CGFloat w = MIN(c.bounds.size.width - 24, 440);
-    CGFloat h = 145.0;
-    CGFloat y = (c.bounds.size.height - h) / 2.0;
-
-    UIView *card = [self buildCardContainerWithFrame:CGRectMake((c.bounds.size.width - w) / 2.0, y, w, h)
-                                               title:isSuccess ? @"🎉 HOÀN TẤT NHẬP MULTI-SCENE" : @"⚠️ THÔNG BÁO HOÀN TẤT"
-                                            subtitle:msg ?: @""];
-    card.layer.borderColor = (isSuccess ? VSToolAccentColor() : [UIColor colorWithRed:1.0 green:0.55 blue:0.5 alpha:1.0]).CGColor;
-
-    UIButton *closeBtn = VSToolCreateOutlineButton(@"Xong / Đóng", CGRectMake((w - 140) / 2.0, h - 48, 140, 36));
-    [closeBtn addTarget:self action:@selector(dismissCompletionCard) forControlEvents:UIControlEventTouchUpInside];
-    [card addSubview:closeBtn];
-
-    [c addSubview:card];
-    self.completionCardView = card;
-
-    // Tự động ẩn Card & HUD sau 8 giây
-    VSDispatchAfterMS(8000, ^{
-        if (self.completionCardView == card) {
-            [self dismissCompletionCard];
-            [self updateStatusHUD:nil];
-        }
-    });
-}
-
-- (void)dismissCompletionCard {
-    if (self.completionCardView) {
-        [UIView animateWithDuration:0.25 animations:^{
-            self.completionCardView.alpha = 0.0;
-        } completion:^(BOOL finished) {
-            [self.completionCardView removeFromSuperview];
-            self.completionCardView = nil;
-        }];
-    }
-}
-
 
 - (void)dismissBottomActionBar { [self.bottomActionBar removeFromSuperview]; self.bottomActionBar = nil; }
 
@@ -2140,7 +2086,7 @@ static void VSImportBatchCodes(VSTool *tool, NSArray *images, NSUInteger runId) 
 }
 
 // ============================================================================
-// CHỨC NĂNG 1: Auto nhập ảnh/video (VSAuto chuẩn)
+// CHỨC NĂNG 1: Auto nhập ảnh/video (logic VSAuto)
 // ============================================================================
 
 - (void)executeFeature1ReplaceLayers {
@@ -2289,17 +2235,14 @@ static void VSImportBatchCodes(VSTool *tool, NSArray *images, NSUInteger runId) 
 }
 
 // ============================================================================
-// CHỨC NĂNG 4: Nhập code + ảnh hàng loạt theo phân cảnh (v5 ĐÃ SỬA HOÀN TOÀN)
-// - Mỗi scene: Mở editor -> Import Preset -> Mở bảng chọn ảnh (chọn 1 ảnh) ->
-//   Tự động copy ảnh sang tất cả các lớp fillable như Chức năng 1 ->
-//   Tự động bấm Tạo -> Sau khi xong tự động sang phân cảnh tiếp theo -> Lặp lại.
+// CHỨC NĂNG 4: Nhập code + ảnh hàng loạt theo phân cảnh
+// Lưu ý: mỗi phân cảnh cần chọn lại ảnh/video (không còn replay media đã chọn).
 // ============================================================================
 
 - (void)executeFeature4BatchMultiScene {
     id reviewVC = VSFindTopViewControllerNamed(@"VideoReviewEditVC");
     if (!reviewVC) { [self showNotificationAlert:@"Vào màn hình phân cảnh trước" title:@"Sai vị trí"]; return; }
     NSUInteger runId = [self startNewTaskWithDescription:@"Auto code + ảnh" initialStatus:nil];
-    g_savedMultiSceneImage = nil;
 
     __block NSUInteger origScene = 0;
     VSTry(^{ origScene = [reviewVC lastViewedSceneIndex]; });
@@ -2463,6 +2406,7 @@ static void VSImportBatchCodes(VSTool *tool, NSArray *images, NSUInteger runId) 
 }
 
 - (void)executeBatchProcessingScenesWithRunId:(NSUInteger)runId {
+    // Mỗi phân cảnh: mở editor -> nhập preset -> chọn ảnh/video điền các lớp -> Tạo.
     NSUInteger start = self.multiSceneStart;
     NSUInteger total = self.multiSceneCount;
     NSUInteger orig = self.multiSceneOriginalLastViewed;
@@ -2476,19 +2420,9 @@ static void VSImportBatchCodes(VSTool *tool, NSArray *images, NSUInteger runId) 
         id rvc = VSFindTopViewControllerNamed(@"VideoReviewEditVC");
         VSTry(^{ [rvc setLastViewedSceneIndex:orig]; });
         [self terminateCurrentTaskQuietly];
-        
-        NSString *resultMsg = nil;
-        if (err) {
-            resultMsg = [NSString stringWithFormat:@"⚠️ Dừng lại ở phân cảnh %lu/%lu: %@", (unsigned long)okCount, (unsigned long)total, err];
-        } else {
-            resultMsg = [NSString stringWithFormat:@"🎉 ĐÃ NHẬP XONG %lu/%lu PHÂN CẢNH THÀNH CÔNG!", (unsigned long)okCount, (unsigned long)total];
-        }
-
-        // Cập nhật ngay lên thanh HUD trên màn hình
-        [self updateStatusHUD:resultMsg];
-
-        // Hiển thị Card thông báo hoàn tất an toàn 100% (không dùng UIAlertController để tránh văng app)
-        [self showCompletionCardWithMessage:resultMsg isSuccess:(err == nil)];
+        NSString *msg = [NSString stringWithFormat:@"Xong %lu/%lu scene", (unsigned long)okCount, (unsigned long)total];
+        NSString *full = err ? [err stringByAppendingFormat:@"\n%@", msg] : msg;
+        [self showRunResultAlert:full title:err ? @"Dừng" : @"Thành công"];
     };
 
     step = ^{
@@ -2496,114 +2430,47 @@ static void VSImportBatchCodes(VSTool *tool, NSArray *images, NSUInteger runId) 
         if (offset >= total) { finish(nil); return; }
         NSUInteger o = offset++, sc = start + o;
         NSString *label = [NSString stringWithFormat:@"Scene %lu", (unsigned long)(sc + 1)];
-        [self updateStatusHUD:[NSString stringWithFormat:@"%@ (%lu/%lu): đang mở…", label, (unsigned long)(o + 1), (unsigned long)total]];
-        
+        [self updateStatusHUD:[NSString stringWithFormat:@"%@ (%lu/%lu): mở…", label, (unsigned long)(o + 1), (unsigned long)total]];
         id rvc = VSFindTopViewControllerNamed(@"VideoReviewEditVC");
         [self openMultiLayerEditorForScene:sc reviewVC:rvc runId:runId completion:^(id editor) {
             if (runId != g_runIdentifier) { step = nil; return; }
             if (!editor) { finish([label stringByAppendingString:@": không mở được editor"]); return; }
 
             __weak id wEd = editor;
-            [self updateStatusHUD:[label stringByAppendingString:@": nạp preset…"]];
+            [self updateStatusHUD:[label stringByAppendingString:@": nhập preset…"]];
             [self importPresetPayload:presets[o] codeIdentifier:codes[o] intoEditor:editor runId:runId completion:^(NSString *e1) {
                 if (runId != g_runIdentifier) { step = nil; return; }
                 if (e1) { finish([NSString stringWithFormat:@"%@: %@", label, e1]); return; }
-                
-                // Rút ngắn delay chờ preset nạp xong xuống 80ms
-                VSDispatchAfterMS(80, ^{
+                VSDispatchAfterMS(500, ^{
                     if (runId != g_runIdentifier) { step = nil; return; }
                     id ed = wEd;
                     if (!VSEditorIsAlive(ed)) { finish([label stringByAppendingString:@": editor đã bị đóng"]); return; }
 
                     NSArray<NSNumber *> *layers = VSDetectFillableLayers(VSEngineFrom(ed), YES);
-                    if (layers.count == 0) {
-                        // Preset này không có lớp video/ảnh, chuyển thẳng sang Tạo
-                        [self updateStatusHUD:[label stringByAppendingString:@": không có lớp media, tiến hành Tạo…"]];
-                        [self waitForEditorSettledThenCreate:ed runId:runId completion:^(NSString *e2) {
-                            if (runId != g_runIdentifier) { step = nil; return; }
-                            if (e2) { finish([NSString stringWithFormat:@"%@: %@", label, e2]); return; }
-                            okCount++;
-                            VSSafePoll(runId, 35, 150, ^BOOL{ return VSFindTopViewControllerNamed(@"VideoReviewEditVC") != nil; }, ^(BOOL back) {
-                                if (runId != g_runIdentifier) { step = nil; return; }
-                                if (!back) { finish(@"Không quay lại được"); return; }
-                                VSDispatchAfterMS(40, ^{ if (step) step(); });
-                            });
-                        }];
-                        return;
-                    }
+                    if (layers.count == 0) { finish([label stringByAppendingString:@": preset không có lớp video/ảnh"]); return; }
 
-                    // XỬ LÝ MEDIA THEO LOGIC MỚI:
-                    // - Phân cảnh 1: Mở bảng chọn ảnh 1 lần duy nhất, lấy ảnh lưu vào g_savedMultiSceneImage.
-                    // - Các phân cảnh tiếp theo: Tự động dùng lại ảnh đó, KHÔNG MỞ LẠI BẢNG CHỌN ẢNH NỮA!
-                    void (^onLayersFilled)(NSUInteger, NSUInteger, NSArray<NSNumber *> *, NSString *) = ^(NSUInteger copied, NSUInteger targets, NSArray<NSNumber *> *unconfirmed, NSString *stop) {
+                    [self updateStatusHUD:[label stringByAppendingString:@": chọn ảnh/video để điền các lớp…"]];
+                    [VSLayerFiller fillLayers:layers editor:ed runId:runId requirePickerOpen:YES completion:^(NSUInteger copied, NSUInteger targets, NSArray<NSNumber *> *unconfirmed, NSString *stop) {
                         if (runId != g_runIdentifier) { step = nil; return; }
                         if (stop) { finish([NSString stringWithFormat:@"%@: %@", label, stop]); return; }
-                        
+                        if (unconfirmed.count) {
+                            finish([NSString stringWithFormat:@"%@: còn %lu lớp chưa xác nhận, chưa Tạo", label, (unsigned long)unconfirmed.count]);
+                            return;
+                        }
                         id edDone = wEd;
                         if (!VSEditorIsAlive(edDone)) { finish([label stringByAppendingString:@": editor bị đóng trước khi Tạo"]); return; }
 
-                        // Nếu chưa lưu ảnh (Scene đầu tiên), lưu lại UIImage để dùng cho các scene tiếp theo
-                        if (!g_savedMultiSceneImage) {
-                            VSTry(^{
-                                id curEngine = VSEngineFrom(edDone);
-                                id srcLayer = (curEngine && [curEngine respondsToSelector:@selector(layerAtLayerNum:)]) ? [curEngine layerAtLayerNum:layers.firstObject.unsignedIntegerValue] : nil;
-                                if (srcLayer && [srcLayer respondsToSelector:@selector(layerImage)]) {
-                                    g_savedMultiSceneImage = [srcLayer layerImage];
-                                }
-                                if (!g_savedMultiSceneImage && [edDone respondsToSelector:@selector(layerImage)]) {
-                                    g_savedMultiSceneImage = [edDone layerImage];
-                                }
-                            });
-                        }
-
-                        [self updateStatusHUD:[label stringByAppendingString:@": hoàn tất chép lớp, đang Tạo…"]];
                         [self waitForEditorSettledThenCreate:edDone runId:runId completion:^(NSString *e2) {
                             if (runId != g_runIdentifier) { step = nil; return; }
                             if (e2) { finish([NSString stringWithFormat:@"%@: %@", label, e2]); return; }
                             okCount++;
-                            
-                            // Chờ quay lại VideoReviewEditVC với poll interval 35ms siêu nhanh
-                            VSSafePoll(runId, 35, 150, ^BOOL{ return VSFindTopViewControllerNamed(@"VideoReviewEditVC") != nil; }, ^(BOOL back) {
+                            VSSafePoll(runId, 100, 120, ^BOOL{ return VSFindTopViewControllerNamed(@"VideoReviewEditVC") != nil; }, ^(BOOL back) {
                                 if (runId != g_runIdentifier) { step = nil; return; }
                                 if (!back) { finish(@"Không quay lại được"); return; }
-                                // Chuyển cảnh ngay sau 40ms!
-                                VSDispatchAfterMS(40, ^{ if (step) step(); });
+                                VSDispatchAfterMS(300, ^{ if (step) step(); });
                             });
                         }];
-                    };
-
-                    if (g_savedMultiSceneImage && [ed respondsToSelector:@selector(makePhotoLayer:)] && [ed respondsToSelector:@selector(overwrite:isAbleToShowTheLayerActionMenu:)]) {
-                        // TỰ ĐỘNG DÙNG LẠI ẢNH ĐÃ CHỌN CHO CÁC PHÂN CẢNH TIẾP THEO (SIÊU TỐC - KHÔNG MỞ PICKER)
-                        [self updateStatusHUD:[label stringByAppendingString:@": tự động nạp ảnh đã chọn…"]];
-                        NSUInteger src = layers.firstObject.unsignedIntegerValue;
-                        if ([ed respondsToSelector:@selector(selectLayerNum:flash:)]) {
-                            [ed selectLayerNum:src flash:NO];
-                        }
-                        id newLayer = [ed makePhotoLayer:g_savedMultiSceneImage];
-                        if (newLayer) {
-                            [ed overwrite:newLayer isAbleToShowTheLayerActionMenu:NO];
-                        }
-                        
-                        // Chép sang các lớp còn lại nếu phân cảnh có nhiều hơn 1 lớp
-                        id curEngine = VSEngineFrom(ed);
-                        for (NSUInteger i = 1; i < layers.count; i++) {
-                            NSUInteger target = layers[i].unsignedIntegerValue;
-                            if ([ed respondsToSelector:@selector(selectLayerNum:flash:)]) {
-                                [ed selectLayerNum:target flash:NO];
-                            }
-                            VSFireCopyLayer(ed, curEngine, src);
-                        }
-                        if ([ed respondsToSelector:@selector(selectLayerNum:flash:)]) {
-                            [ed selectLayerNum:src flash:NO];
-                        }
-                        
-                        // Chuyển thẳng sang bước Tạo ngay lập tức!
-                        onLayersFilled(layers.count > 1 ? layers.count - 1 : 1, layers.count - 1, @[], nil);
-                    } else {
-                        // Phân cảnh đầu tiên: Mở picker cho người dùng chọn ảnh 1 lần
-                        [self updateStatusHUD:[label stringByAppendingString:@": chọn 1 ảnh (sẽ tự dùng tiếp cho các scene sau)…"]];
-                        [VSLayerFiller fillLayers:layers editor:ed runId:runId completion:onLayersFilled];
-                    }
+                    }];
                 });
             }];
         }];
@@ -2628,7 +2495,7 @@ static void VSImportBatchCodes(VSTool *tool, NSArray *images, NSUInteger runId) 
     if (existing) { done(existing); return; }
     if (!rvc) { done(nil); return; }
     if (!VSTry(^{ [rvc setLastViewedSceneIndex:scene]; [rvc showMultiLayer]; })) { done(nil); return; }
-    VSSafePoll(runId, 35, 120, ^BOOL{ return current() != nil; }, ^(BOOL ok) {
+    VSSafePoll(runId, 80, 100, ^BOOL{ return current() != nil; }, ^(BOOL ok) {
         done(ok ? current() : nil);
     });
 }
@@ -2642,7 +2509,7 @@ static void VSImportBatchCodes(VSTool *tool, NSArray *images, NSUInteger runId) 
     __weak id wEd = editor;
     VSObjProvider prov = ^id{ return wEd; };
     __block BOOL blocked = NO;
-    VSSafePollEditor(runId, 35, 200, prov, ^BOOL(id ed) {
+    VSSafePollEditor(runId, 50, 200, prov, ^BOOL(id ed) {
         VSPopupActionStatus s = VSResolvePopupsImmediately(ed);
         if (s == VSPopupActionStatusBlockedPurchase) { blocked = YES; return YES; }
         return g_presetImportEventCounter > before;
@@ -2653,7 +2520,7 @@ static void VSImportBatchCodes(VSTool *tool, NSArray *images, NSUInteger runId) 
         VSDispatchAfterMS(500, ^{
             if (runId != g_runIdentifier) return;
             __block BOOL purchase = NO;
-            VSSafePollEditor(runId, 35, 70, prov, ^BOOL(id ed) {
+            VSSafePollEditor(runId, 60, 60, prov, ^BOOL(id ed) {
                 if (VSResolvePopupsImmediately(ed) == VSPopupActionStatusBlockedPurchase) { purchase = YES; return YES; }
                 return !VSHasAnyActivePopup(ed) && VSNumActiveLayers(VSEngineFrom(ed)) > 0;
             }, ^(BOOL ready) {
@@ -2669,13 +2536,13 @@ static void VSImportBatchCodes(VSTool *tool, NSArray *images, NSUInteger runId) 
     VSObjProvider prov = ^id{ return wEd; };
     __block NSUInteger stable = 0;
     __block BOOL purchase = NO;
-    VSSafePollEditor(runId, 35, 120, prov, ^BOOL(id ed) {
+    VSSafePollEditor(runId, 100, 150, prov, ^BOOL(id ed) {
         if (!VSEditorIsAlive(ed)) return YES;
         VSDismissLayerActionMenus(ed);
         if (VSResolvePopupsImmediately(ed) == VSPopupActionStatusBlockedPurchase) { purchase = YES; return YES; }
         BOOL calm = !VSHasAnyActivePopup(ed) && !VSEditorIsBusy(ed);
         stable = calm ? stable + 1 : 0;
-        return stable >= 3;
+        return stable >= 8;
     }, ^(BOOL ok) {
         if (runId != g_runIdentifier) return;
         if (purchase) { done(@"Popup mua Pro"); return; }
@@ -2705,7 +2572,7 @@ static void VSImportBatchCodes(VSTool *tool, NSArray *images, NSUInteger runId) 
     __weak id wEd = editor;
     VSObjProvider prov = ^id{ return wEd; };
     __block BOOL blocked = NO;
-    VSSafePollEditor(runId, 35, 600, prov, ^BOOL(id ed) {
+    VSSafePollEditor(runId, 100, 600, prov, ^BOOL(id ed) {
         if (VSResolvePopupsImmediately(ed) == VSPopupActionStatusBlockedPurchase) { blocked = YES; return YES; }
         return !([ed isViewLoaded] && [[ed view] window]);
     }, ^(BOOL closed) {
