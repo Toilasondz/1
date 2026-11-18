@@ -103,7 +103,6 @@ typedef void (^VSFillCompletion)(NSUInteger copied, NSUInteger targets, NSArray<
 - (void)setSplitPoint;
 - (void)doSplit;
 - (void)gotoTime:(CMTime)t;
-- (CMTime)currentTime;
 @end
 
 // ============================================================================
@@ -214,6 +213,16 @@ static NSArray<UIWindow *> *VSAllWindows(void) {
         [all addObjectsFromArray:((UIWindowScene *)scene).windows];
     }
     return all;
+}
+
+// Đọc currentTime của đối tượng (CMTime là struct lớn, lấy IMP để tránh xung đột khai báo với AVFoundation).
+static CMTime VSCurrentTime(id obj) {
+    SEL sel = @selector(currentTime);
+    if (!obj || ![obj respondsToSelector:sel]) return kCMTimeInvalid;
+    @try {
+        CMTime (*fn)(id, SEL) = (CMTime (*)(id, SEL))[obj methodForSelector:sel];
+        return fn(obj, sel);
+    } @catch (NSException *__unused e) { return kCMTimeInvalid; }
 }
 
 static UIViewController *VSSearchVC(UIViewController *root, Class target, int depth) {
@@ -970,7 +979,7 @@ static void VSJobFinish(VSBatchJob *job, NSString *err) {
 static BOOL VSAddReuseClip(VSBatchJob *job, NSUInteger sc) {
     if (!job.reuseURL) return NO;
     id rvc = job.reviewVC;
-    id proj = nil;
+    __block id proj = nil;
     VSTry(^{ proj = [rvc project]; });
     if (!proj || ![proj respondsToSelector:@selector(addNewClipToSceneAtIndex:clipURL:sourceClipIndex:makeActive:image:frameTimes:)]) return NO;
     __block BOOL ok = NO;
@@ -983,7 +992,7 @@ static BOOL VSAddReuseClip(VSBatchJob *job, NSUInteger sc) {
 // Lấy frame times của clip đang hoạt động ở phân cảnh sc (dùng cho lần thêm clip sau).
 static void VSCaptureFrameTimes(VSBatchJob *job, NSUInteger sc) {
     id rvc = job.reviewVC;
-    id proj = nil;
+    __block id proj = nil;
     VSTry(^{ proj = [rvc project]; });
     if (!proj) return;
     VSTry(^{
@@ -1189,9 +1198,9 @@ static void VSRunBeatSplit(void) {
         }
         VSAfterMS(60, ^{
             if (runId != g_runIdentifier) { step = nil; return; }
-            CMTime cur = kCMTimeInvalid;
+            __block CMTime cur = kCMTimeInvalid;
             id s2 = wSv;
-            if (s2) VSTry(^{ cur = [s2 currentTime]; });
+            if (s2) cur = VSCurrentTime(s2);
             if (CMTIME_IS_VALID(cur) && (CMTIME_IS_INVALID(last) || CMTimeCompare(cur, last) > 0)) {
                 VSTry(^{ [s2 setSplitPoint]; });
                 last = cur;
