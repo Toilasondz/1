@@ -580,7 +580,10 @@ static UIWindow *VSFindKeyWindow(void) {
         }
         if (ws.windows.count > 0) return ws.windows.firstObject;
     }
+    #pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     return UIApplication.sharedApplication.keyWindow;
+#pragma clang diagnostic pop
 }
 
 static UIViewController *VSTopViewControllerFrom(UIViewController *root) {
@@ -1029,7 +1032,6 @@ static VSLayerFiller *g_activeFiller = nil;
 
 - (void)setupToolInterfaceIfNeeded {
     if (self.window) return;
-    UIWindow *keyW = VSFindKeyWindow();
     UIWindowScene *ws = nil;
     if (@available(iOS 13.0, *)) {
         for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
@@ -1455,7 +1457,7 @@ static VSLayerFiller *g_activeFiller = nil;
         return;
     }
     
-    NSUInteger origScene = 0;
+    __block NSUInteger origScene = 0;
     VSTry(^{ origScene = [reviewVC lastViewedSceneIndex]; });
     
     // Đóng bảng Merge panel của Video Star & ẩn nút
@@ -1557,8 +1559,7 @@ static VSLayerFiller *g_activeFiller = nil;
         
         NSString *msg = [NSString stringWithFormat:@"Đã nhập xong %lu/%lu phân cảnh thành công!", (unsigned long)okCount, (unsigned long)total];
         if (err) {
-            msg = [NSString stringWithFormat:@"Dừng ở cảnh %lu: %@
-(Đã xong %lu/%lu cảnh)", (unsigned long)(start + offset), err, (unsigned long)okCount, (unsigned long)total];
+            msg = [NSString stringWithFormat:@"Dừng ở cảnh %lu: %@ - Đã xong %lu/%lu cảnh", (unsigned long)(start + offset), err, (unsigned long)okCount, (unsigned long)total];
         }
         [self showCompletionCardWithMessage:msg isSuccess:(err == nil)];
     };
@@ -1694,7 +1695,7 @@ static VSLayerFiller *g_activeFiller = nil;
                     }
                 });
             }];
-        });
+        }];
     };
     step();
 }
