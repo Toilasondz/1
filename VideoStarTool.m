@@ -52,7 +52,7 @@
 - (void)splitScene;
 @end
 
-#pragma mark - 1. Per-Class IMP Registry (Khắc Phục Triệt Để Bug #8)
+#pragma mark - 1. Per-Class IMP Registry
 
 static NSMutableDictionary<NSString *, NSValue *> *g_origIMPRegistry = nil;
 
@@ -68,7 +68,6 @@ static void VSTHookMethodOnClass(Class cls, SEL sel, IMP newIMP) {
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return;
     
-    // Chỉ hook nếu chính class này hoặc nhánh của nó có method và chưa được đăng ký
     NSString *key = VSTKeyForClassAndSelector(cls, sel);
     if (g_origIMPRegistry[key]) return;
     
@@ -206,7 +205,7 @@ static IMP VSTGetOriginalIMP(id selfObj, SEL sel) {
 
 @end
 
-#pragma mark - 3. VSBatchLayerFiller: Ghi Ảnh Thật Vào Engine (Đã Fix Bug #3, #4, #5)
+#pragma mark - 3. VSBatchLayerFiller: Ghi Ảnh Thật Vào Engine
 
 @interface VSBatchLayerFiller : NSObject
 + (nullable id)multiLayerEngineFromEditor:(id)editorVC;
@@ -217,7 +216,6 @@ static IMP VSTGetOriginalIMP(id selfObj, SEL sel) {
 
 @implementation VSBatchLayerFiller
 
-// Fix Bug #3: Kiểm tra ivar_getTypeEncoding và xác thực selector layerAtLayerNum:
 + (nullable id)multiLayerEngineFromEditor:(id)editorVC {
     if (!editorVC) return nil;
     @try {
@@ -243,7 +241,6 @@ static IMP VSTGetOriginalIMP(id selfObj, SEL sel) {
     return nil;
 }
 
-// Fix Bug #4 & #5: Dùng đúng numActiveLayers, lọc bỏ Null / 3D / Text Layer
 + (NSArray<NSNumber *> *)eligibleLayerNumsFromEngine:(id)engine {
     NSMutableArray<NSNumber *> *targets = [NSMutableArray array];
     if (!engine) return targets;
@@ -334,7 +331,6 @@ static IMP VSTGetOriginalIMP(id selfObj, SEL sel) {
     } @catch (NSException *e) {}
 }
 
-// Fix Bug #4: Điền chuẩn theo eligibleLayers, lấy layerType thật, clearMask:YES, verify sau khi điền
 + (BOOL)fillAllActiveLayersInEditor:(id)editorVC withImage:(UIImage *)image {
     if (!editorVC || !image) return NO;
     
@@ -405,7 +401,7 @@ static IMP VSTGetOriginalIMP(id selfObj, SEL sel) {
 
 @end
 
-#pragma mark - 4. VSAutoCoordinator: Điều Phối Tự Động Hóa & State Machine (Đã Fix Bug #1, #2, #6, #7, #9)
+#pragma mark - 4. VSAutoCoordinator: Điều Phối Tự Động Hóa & State Machine
 
 typedef NS_ENUM(NSInteger, VSTContextType) {
     VSTContextTypeHidden = 0,
@@ -431,7 +427,7 @@ typedef NS_ENUM(NSInteger, VSTBatchPhase) {
 
 @property (nonatomic, weak) UIViewController *activeSplitVC;
 @property (nonatomic, weak) UIViewController *activeMultiLayerVC;
-@property (nonatomic, strong) UIViewController *batchActiveEditor; // Fix Bug #9: Strong retain trong lúc chạy step
+@property (nonatomic, strong) UIViewController *batchActiveEditor;
 @property (nonatomic, weak) id activeProjectInstance;
 
 @property (nonatomic, assign) NSInteger targetSegmentCount;
@@ -567,7 +563,8 @@ typedef NS_ENUM(NSInteger, VSTBatchPhase) {
                 self.actionButton.layer.borderColor = [UIColor systemOrangeColor].CGColor;
             } else {
                 [self.actionButton setTitle:@"⚡ Kết Hợp" forState:UIControlStateNormal];
-                self.actionButton.layer.borderColor = [UIColor systemCyanColor].CGColor;
+                // Màu Cyan RGB tương thích iOS 14.0+ (không gây lỗi -Wunguarded-availability-new)
+                self.actionButton.layer.borderColor = [UIColor colorWithRed:0.00 green:0.80 blue:1.00 alpha:1.0].CGColor;
             }
             self.actionButton.hidden = NO;
             [win bringSubviewToFront:self.actionButton];
@@ -606,7 +603,7 @@ typedef NS_ENUM(NSInteger, VSTBatchPhase) {
     if ([clsName containsString:@"MultiLayer"] || [clsName containsString:@"KeyframeEditor"] || [clsName containsString:@"MLLayer"]) {
         if (appearing) {
             self.activeMultiLayerVC = vc;
-            self.batchActiveEditor = vc; // Fix Bug #9: Retain mạnh khi VC đang hoạt động
+            self.batchActiveEditor = vc;
             self.currentContext = VSTContextTypeMultiLayer;
         } else if (self.activeMultiLayerVC == vc && self.batchPhase == VSTBatchPhaseIdle) {
             self.currentContext = VSTContextTypeHidden;
@@ -634,7 +631,7 @@ typedef NS_ENUM(NSInteger, VSTBatchPhase) {
     self.batchPhase = VSTBatchPhaseIdle;
     self.suppressAllOverwriteDialogs = NO;
     self.cachedFirstSegmentImage = nil;
-    self.batchActiveEditor = nil; // Fix Bug #9: Giải phóng strong reference
+    self.batchActiveEditor = nil;
     [self.qrImagesQueue removeAllObjects];
     [self.qrStringsQueue removeAllObjects];
     [self refreshActionButtonUI];
@@ -722,10 +719,9 @@ typedef NS_ENUM(NSInteger, VSTBatchPhase) {
     }
 }
 
-#pragma mark - PHPicker & UIImagePicker Delegate (Đã Fix Bug #7)
+#pragma mark - PHPicker & UIImagePicker Delegate
 
 - (NSInteger)determineSafeStartingSceneIndex {
-    // Fix Bug #7: readCurrentSceneIndexFromProject trả về NSNotFound nếu không đọc được
     NSInteger currentIdx = [self readCurrentSceneIndexFromProject];
     if (currentIdx == NSNotFound) {
         UIViewController *editor = self.activeMultiLayerVC ?: self.batchActiveEditor;
@@ -839,7 +835,7 @@ typedef NS_ENUM(NSInteger, VSTBatchPhase) {
     }];
 }
 
-#pragma mark - Chu Trình Thực Thi Từng Phân Đoạn (Fix Bug #6 & #9)
+#pragma mark - Chu Trình Thực Thi Từng Phân Đoạn
 
 - (void)executeCurrentSegmentStep {
     if (self.currentSegmentIdx >= self.targetSegmentCount || self.currentSegmentIdx >= self.qrStringsQueue.count) {
@@ -847,7 +843,6 @@ typedef NS_ENUM(NSInteger, VSTBatchPhase) {
         return;
     }
     
-    // Fix Bug #9: Retain mạnh editor hiện tại trong suốt bước chạy
     self.batchActiveEditor = self.activeMultiLayerVC ?: self.batchActiveEditor;
     if (!self.batchActiveEditor) {
         [self resetBatchState];
@@ -861,7 +856,7 @@ typedef NS_ENUM(NSInteger, VSTBatchPhase) {
     NSString *qrCodeString = self.qrStringsQueue[self.currentSegmentIdx];
     UIImage *qrCodeImage = self.qrImagesQueue[self.currentSegmentIdx];
     
-    // Bước 1: Nạp mã QR trực tiếp vào Editor (bảng "Trùng khớp" sẽ bị bypass ngay bởi hook confirmOverwrite:)
+    // Bước 1: Nạp mã QR trực tiếp vào Editor
     [self injectQRIntoActiveEditor:self.batchActiveEditor withString:qrCodeString image:qrCodeImage];
     
     // Bước 2: Sau khi nạp QR hoàn tất
@@ -871,7 +866,7 @@ typedef NS_ENUM(NSInteger, VSTBatchPhase) {
             self.batchPhase = VSTBatchPhaseWaitingSegment1Image;
             [self openFirstSegmentContentImagePicker];
         } else {
-            // Đoạn 2..N: Tự động điền luôn ảnh đã lưu từ Đoạn 1 vào tất cả các lớp mà không cần chọn lại
+            // Đoạn 2..N: Tự động điền luôn ảnh đã lưu từ Đoạn 1 vào tất cả các lớp
             self.batchPhase = VSTBatchPhaseFillingAllLayers;
             [self fillAllLayersAndAutoCreateWithImage:self.cachedFirstSegmentImage];
         }
@@ -951,7 +946,6 @@ typedef NS_ENUM(NSInteger, VSTBatchPhase) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self triggerCreateOnEditor:editor];
         
-        // Giải phóng editor của phân đoạn vừa tạo xong trước khi chuyển sang phân đoạn mới
         UIViewController *previousEditor = editor;
         self.batchActiveEditor = nil;
         
@@ -985,7 +979,7 @@ typedef NS_ENUM(NSInteger, VSTBatchPhase) {
     } @catch (NSException *e) {}
 }
 
-#pragma mark - Chuyển Phân Đoạn Trên Project & Mở Multi-Layer Trên VideoReviewEditVC (Fix Bug #6 & #7)
+#pragma mark - Chuyển Phân Đoạn Trên Project & Mở Multi-Layer Trên VideoReviewEditVC
 
 - (id)resolveActiveProject {
     if (self.activeProjectInstance) return self.activeProjectInstance;
@@ -1008,7 +1002,6 @@ typedef NS_ENUM(NSInteger, VSTBatchPhase) {
     return nil;
 }
 
-// Fix Bug #7: Trả về NSNotFound nếu không đọc được từ Project
 - (NSInteger)readCurrentSceneIndexFromProject {
     @try {
         id proj = [self resolveActiveProject];
@@ -1019,7 +1012,6 @@ typedef NS_ENUM(NSInteger, VSTBatchPhase) {
     return NSNotFound;
 }
 
-// Fix Bug #6: Cập nhật lastViewedSceneIndex trên Project và gọi showMultiLayer trên VideoReviewEditVC
 - (void)advanceProjectToNextSceneAndOpenMultiLayerFromPreviousEditor:(UIViewController *)previousEditor {
     // 1. Cập nhật lastViewedSceneIndex trên Project
     id proj = [self resolveActiveProject];
@@ -1038,46 +1030,45 @@ typedef NS_ENUM(NSInteger, VSTBatchPhase) {
         } @catch (NSException *e) {}
     }
     
-    // 3. Poll chờ MultiLayer VC của phân đoạn mới xuất hiện rồi chạy tiếp
+    // 3. Poll chờ MultiLayer VC của phân đoạn mới xuất hiện (Không dùng self-capturing block để tránh -Warc-retain-cycles)
     self.batchPhase = VSTBatchPhaseAdvancingScene;
-    __weak typeof(self) weakSelf = self;
-    __block NSInteger tries = 0;
-    __block void (^pollBlock)(void) = nil;
-    
-    pollBlock = ^{
-        __strong typeof(weakSelf) ss = weakSelf;
-        if (!ss || ss.batchPhase != VSTBatchPhaseAdvancingScene) return;
-        if (++tries > 100) {
-            [ss resetBatchState];
-            return;
-        }
-        
-        // Nếu reviewVC vừa mới xuất hiện sau khi editor cũ đóng lại, kích hoạt showMultiLayer
-        if (tries == 10 && (!ss.activeMultiLayerVC || ss.activeMultiLayerVC == previousEditor)) {
-            UIViewController *rev = [ss findViewControllerNamed:@"VideoReviewEditVC"];
-            if (rev && [rev respondsToSelector:@selector(showMultiLayer)]) {
-                @try {
-                    ((void (*)(id, SEL))objc_msgSend)(rev, @selector(showMultiLayer));
-                } @catch (NSException *e) {}
-            }
-        }
-        
-        if (ss.activeMultiLayerVC &&
-            ss.activeMultiLayerVC.isViewLoaded &&
-            ss.activeMultiLayerVC.view.window != nil) {
-            ss.batchActiveEditor = ss.activeMultiLayerVC;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [ss executeCurrentSegmentStep];
-            });
-            return;
-        }
-        
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)), dispatch_get_main_queue(), pollBlock);
-    };
-    pollBlock();
+    [self pollForNextMultiLayerEditorWithPreviousEditor:previousEditor attempt:0];
 }
 
-#pragma mark - 5. Các Hàm Hook C-Function (Đã Fix Bug #1, #2, #8)
+- (void)pollForNextMultiLayerEditorWithPreviousEditor:(UIViewController *)previousEditor attempt:(NSInteger)tries {
+    if (self.batchPhase != VSTBatchPhaseAdvancingScene) return;
+    if (tries > 100) {
+        [self resetBatchState];
+        return;
+    }
+    
+    if (tries == 10 && (!self.activeMultiLayerVC || self.activeMultiLayerVC == previousEditor)) {
+        UIViewController *rev = [self findViewControllerNamed:@"VideoReviewEditVC"];
+        if (rev && [rev respondsToSelector:@selector(showMultiLayer)]) {
+            @try {
+                ((void (*)(id, SEL))objc_msgSend)(rev, @selector(showMultiLayer));
+            } @catch (NSException *e) {}
+        }
+    }
+    
+    if (self.activeMultiLayerVC &&
+        self.activeMultiLayerVC.isViewLoaded &&
+        self.activeMultiLayerVC.view.window != nil) {
+        self.batchActiveEditor = self.activeMultiLayerVC;
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [weakSelf executeCurrentSegmentStep];
+        });
+        return;
+    }
+    
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [weakSelf pollForNextMultiLayerEditorWithPreviousEditor:previousEditor attempt:(tries + 1)];
+    });
+}
+
+#pragma mark - 5. Các Hàm Hook C-Function
 
 static void vs_hooked_viewDidAppear(UIViewController *self, SEL _cmd, BOOL animated) {
     IMP orig = VSTGetOriginalIMP(self, _cmd);
@@ -1091,7 +1082,6 @@ static void vs_hooked_viewWillDisappear(UIViewController *self, SEL _cmd, BOOL a
     [[VSAutoCoordinator shared] evaluateViewControllerContext:self appearing:NO];
 }
 
-// Fix Bug #1: Chỉ chặn chính xác Alert "Trùng khớp", tuyệt đối không nuốt Alert Pro / Lỗi / Bộ nhớ / Xóa
 static void vs_hooked_presentVC(UIViewController *self, SEL _cmd, UIViewController *vcToPresent, BOOL flag, void (^completion)(void)) {
     if ([VSAutoCoordinator shared].suppressAllOverwriteDialogs &&
         [vcToPresent isKindOfClass:[UIAlertController class]]) {
@@ -1141,7 +1131,6 @@ static void vs_hooked_presentVC(UIViewController *self, SEL _cmd, UIViewControll
     if (orig) ((void (*)(id, SEL, UIViewController *, BOOL, void (^)(void)))orig)(self, _cmd, vcToPresent, flag, completion);
 }
 
-// Fix Bug #2 (Biến thể 1): confirmOverwrite:isAbleToShowTheLayerActionMenu:
 static void vs_hooked_confirmOverwrite_1(id self, SEL _cmd, id object, BOOL show) {
     if ([VSAutoCoordinator shared].suppressAllOverwriteDialogs) {
         SEL overwriteSel = @selector(overwrite:isAbleToShowTheLayerActionMenu:);
@@ -1154,7 +1143,6 @@ static void vs_hooked_confirmOverwrite_1(id self, SEL _cmd, id object, BOOL show
     if (orig) ((void (*)(id, SEL, id, BOOL))orig)(self, _cmd, object, show);
 }
 
-// Fix Bug #2 (Biến thể 2): confirmOverwrite:isAbleToShowTheLayerActionMenu:removeOverlayBlending:
 static void vs_hooked_confirmOverwrite_2(id self, SEL _cmd, id object, BOOL show, BOOL remove) {
     if ([VSAutoCoordinator shared].suppressAllOverwriteDialogs) {
         SEL overwriteSel = @selector(overwrite:isAbleToShowTheLayerActionMenu:removeOverlayBlending:);
@@ -1167,7 +1155,6 @@ static void vs_hooked_confirmOverwrite_2(id self, SEL _cmd, id object, BOOL show
     if (orig) ((void (*)(id, SEL, id, BOOL, BOOL))orig)(self, _cmd, object, show, remove);
 }
 
-// Fix Bug #2 (Biến thể 3): confirmAddingLayer:object:object2:object3:isAbleToShowTheLayerActionMenu:
 static void vs_hooked_confirmAddingLayer_5(id self, SEL _cmd, id layer, id obj1, id obj2, id obj3, BOOL show) {
     if ([VSAutoCoordinator shared].suppressAllOverwriteDialogs) {
         SEL directSel = @selector(addingLayer:object:object2:object3:isAbleToShowTheLayerActionMenu:);
@@ -1185,7 +1172,6 @@ static void vs_hooked_confirmAddingLayer_5(id self, SEL _cmd, id layer, id obj1,
     if (orig) ((void (*)(id, SEL, id, id, id, id, BOOL))orig)(self, _cmd, layer, obj1, obj2, obj3, show);
 }
 
-// Hook makePhotoLayer: để bắt ảnh thật ngay khi người dùng chọn ở Đoạn 1
 static void vs_hooked_makePhotoLayer(id self, SEL _cmd, UIImage *image) {
     IMP orig = VSTGetOriginalIMP(self, _cmd);
     if (orig) ((void (*)(id, SEL, UIImage *))orig)(self, _cmd, image);
@@ -1196,15 +1182,13 @@ static void vs_hooked_makePhotoLayer(id self, SEL _cmd, UIImage *image) {
     }
 }
 
-#pragma mark - Cài Đặt Toàn Bộ Hook Qua Per-Class Registry (Fix Bug #8)
+#pragma mark - Cài Đặt Toàn Bộ Hook Qua Per-Class Registry
 
 - (void)installHooks {
-    // 1. Hook UIViewController lifecycle & presentViewController
     VSTHookMethodOnClass([UIViewController class], @selector(viewDidAppear:), (IMP)vs_hooked_viewDidAppear);
     VSTHookMethodOnClass([UIViewController class], @selector(viewWillDisappear:), (IMP)vs_hooked_viewWillDisappear);
     VSTHookMethodOnClass([UIViewController class], @selector(presentViewController:animated:completion:), (IMP)vs_hooked_presentVC);
     
-    // 2. Quét toàn bộ các class MultiLayer / KeyframeEditor và đăng ký per-class IMP
     SEL selOverwrite1 = @selector(confirmOverwrite:isAbleToShowTheLayerActionMenu:);
     SEL selOverwrite2 = @selector(confirmOverwrite:isAbleToShowTheLayerActionMenu:removeOverlayBlending:);
     SEL selConfirmAdd5 = @selector(confirmAddingLayer:object:object2:object3:isAbleToShowTheLayerActionMenu:);
