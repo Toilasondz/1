@@ -1,137 +1,47 @@
-name: Build ZZZZZZVideoStarTool
+name: Build VideoStarTool
 
 on:
   push:
-    branches: [ main, master ]
-    tags: [ 'v*' ]
-  pull_request:
     branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build ZZZZZZVideoStarTool
-    runs-on: macos-latest
-    timeout-minutes: 40
-
-    env:
-      THEOS: ${{ github.workspace }}/theos
-      FINALPACKAGE: 1
-      PKG_NAME: ZZZZZZVideoStarTool
-      PKG_VERSION: 1.0.0
-      PKG_ID: com.yourname.zzzzzzvideostartool
+    runs-on: macos-15
 
     steps:
-      - name: Checkout
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      # -------------------------------------------------------------
-      # 1) Cache Theos
-      # -------------------------------------------------------------
       - name: Cache Theos
         id: cache-theos
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/theos
-          key: theos-${{ runner.os }}-${{ runner.arch }}-v3
+          path: ~/theos
+          key: theos-macos15-v1
 
-      # -------------------------------------------------------------
-      # 2) Cài Theos (nếu cache miss)
-      # -------------------------------------------------------------
-      - name: Install Theos
+      - name: Setup Theos & iOS SDK
         if: steps.cache-theos.outputs.cache-hit != 'true'
         run: |
-          set -e
-          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
-          echo "$THEOS/bin" >> "$GITHUB_PATH"
+          brew install ldid xz
+          git clone --recursive https://github.com/theos/theos.git ~/theos
+          curl -LO https://github.com/theos/sdks/archive/master.zip
+          unzip -q master.zip
+          mv sdks-master/*.sdk ~/theos/sdks/
+          rm -rf master.zip sdks-master
 
-      - name: Add Theos to PATH (cache hit)
-        if: steps.cache-theos.outputs.cache-hit == 'true'
-        run: echo "$THEOS/bin" >> "$GITHUB_PATH"
-
-      # -------------------------------------------------------------
-      # 3) SDK
-      # -------------------------------------------------------------
-      - name: Install Theos SDK
+      - name: Compile VideoStarTool.dylib
+        env:
+          THEOS: /Users/runner/theos
         run: |
-          set -e
-          mkdir -p "$THEOS/sdks"
-          if [ ! -d "$THEOS/sdks/iPhoneOS16.5.sdk" ] && \
-             [ ! -d "$THEOS/sdks/iPhoneOS18.0.sdk" ]; then
-            if curl -fsSL -o /tmp/sdk.tar.xz \
-                "https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz"; then
-              tar -xJf /tmp/sdk.tar.xz -C "$THEOS/sdks"
-            else
-              SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-              VER=$(xcrun --sdk iphoneos --show-sdk-version)
-              cp -R "$SDK" "$THEOS/sdks/iPhoneOS${VER}.sdk"
-            fi
-          fi
-          ls -1 "$THEOS/sdks"
-
-      # -------------------------------------------------------------
-      # 4) Build tools
-      # -------------------------------------------------------------
-      - name: Install build tools
-        run: |
-          set -e
-          brew install ldid xz dpkg make
-          echo "$(brew --prefix dpkg)/bin" >> "$GITHUB_PATH"
-          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
-
-      # -------------------------------------------------------------
-      # 5) Build bằng Theos (ra ZZZZZZVideoStarTool.dylib)
-      # -------------------------------------------------------------
-      - name: Build tweak
-        run: |
-          set -e
-          make clean || true
+          make clean
           make package FINALPACKAGE=1
-          echo "==== PACKAGES ===="
-          ls -la packages/ || true
-          echo "==== THEOS _ ===="
-          ls -la .theos/_/ || true
+          mkdir -p output
+          find .theos/obj -name "*.dylib" -exec cp {} output/VideoStarTool.dylib \;
+          find packages -name "*.deb" -exec cp {} output/ \; 2>/dev/null || true
 
-      # -------------------------------------------------------------
-      # 6) Verify tên dylib output
-      # -------------------------------------------------------------
-      - name: Verify dylib name
-        run: |
-          set -e
-          echo "=== Tìm dylib output ==="
-          find .theos -name "*.dylib" -exec ls -la {} \;
-          echo ""
-          echo "=== Kiểm tra tên ==="
-          if find .theos -name "ZZZZZZVideoStarTool.dylib" | grep -q .; then
-            echo "✅ OK: ZZZZZZVideoStarTool.dylib đã được build"
-          else
-            echo "❌ KHÔNG tìm thấy ZZZZZZVideoStarTool.dylib"
-            echo "Các dylib hiện có:"
-            find .theos -name "*.dylib"
-            exit 1
-          fi
-
-      # -------------------------------------------------------------
-      # 7) Upload artifact
-      # -------------------------------------------------------------
-      - name: Upload .deb
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ZZZZZZVideoStarTool-deb
-          path: |
-            packages/*.deb
-            .theos/_/Library/MobileSubstrate/DynamicLibraries/ZZZZZZVideoStarTool.*
-          if-no-files-found: error
-          retention-days: 30
-
-      # -------------------------------------------------------------
-      # 8) Release nếu push tag
-      # -------------------------------------------------------------
-      - name: Attach to Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: packages/*.deb
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: VideoStarTool-Output
+          path: output/
