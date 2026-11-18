@@ -13,6 +13,11 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
+      # Luôn chạy, không phụ thuộc cache: ldid/dpkg nằm trong Homebrew, không nằm trong cache Theos
+      - name: Install build tools
+        run: |
+          brew install ldid xz dpkg
+
       - name: Cache Theos
         id: cache-theos
         uses: actions/cache@v4
@@ -23,7 +28,6 @@ jobs:
       - name: Setup Theos & iOS SDK
         if: steps.cache-theos.outputs.cache-hit != 'true'
         run: |
-          brew install ldid xz
           git clone --recursive https://github.com/theos/theos.git ~/theos
           curl -LO https://github.com/theos/sdks/archive/master.zip
           unzip -q master.zip
