@@ -12,7 +12,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Compile clean arm64 dylib
+      - name: Compile arm64 dylib
         run: |
           xcrun -sdk iphoneos clang -arch arm64 -dynamiclib -fobjc-arc \
             -miphoneos-version-min=14.0 \
@@ -23,6 +23,8 @@ jobs:
             -framework CoreImage \
             -framework QuartzCore \
             -framework PhotosUI \
+            -framework AVFoundation \
+            -framework CoreMedia \
             VideoStarTool.m -o ZZZZZZVideoStarTool.dylib
 
       - name: Strip signature & verify Mach-O
