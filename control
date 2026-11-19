@@ -1,9 +1,9 @@
-Package: com.yourname.zzzzzzvideostartool
+Package: com.zzzzzz.videostartool
 Name: ZZZZZZVideoStarTool
 Version: 1.0.0
-Architecture: iphoneos-arm64
-Description: 4 chuc nang tu dong cho Video Star 14.3.3 (load sau Pro patch)
-Maintainer: yourname
-Author: yourname
+Architecture: iphoneos-arm
+Description: Tweak tự động hoá VideoStar (multi-scene QR, split, copy layer)
+Maintainer: ZZZZZZ
+Author: ZZZZZZ
 Section: Tweaks
-Depends: mobilesubstrate
+Depends: mobilesubstrate, firmware (>= 14.0)
