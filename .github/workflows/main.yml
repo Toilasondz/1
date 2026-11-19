@@ -1,8 +1,7 @@
-name: Build VideoStarTool
+name: Build VideoStarTool Dylib
 
 on:
   push:
-    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
@@ -10,42 +9,31 @@ jobs:
     runs-on: macos-15
 
     steps:
-      - name: Checkout source
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      # Luôn chạy, không phụ thuộc cache: ldid/dpkg nằm trong Homebrew, không nằm trong cache Theos
-      - name: Install build tools
+      - name: Compile clean arm64 dylib
         run: |
-          brew install ldid xz dpkg
+          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib -fobjc-arc \
+            -miphoneos-version-min=14.0 \
+            -install_name @executable_path/Frameworks/ZZZZZZVideoStarTool.dylib \
+            -framework Foundation \
+            -framework UIKit \
+            -framework CoreGraphics \
+            -framework CoreImage \
+            -framework QuartzCore \
+            -framework PhotosUI \
+            VideoStarTool.m -o ZZZZZZVideoStarTool.dylib
 
-      - name: Cache Theos
-        id: cache-theos
-        uses: actions/cache@v4
-        with:
-          path: ~/theos
-          key: theos-macos15-v1
-
-      - name: Setup Theos & iOS SDK
-        if: steps.cache-theos.outputs.cache-hit != 'true'
+      - name: Strip signature & verify Mach-O
         run: |
-          git clone --recursive https://github.com/theos/theos.git ~/theos
-          curl -LO https://github.com/theos/sdks/archive/master.zip
-          unzip -q master.zip
-          mv sdks-master/*.sdk ~/theos/sdks/
-          rm -rf master.zip sdks-master
+          codesign --remove-signature ZZZZZZVideoStarTool.dylib || true
+          file ZZZZZZVideoStarTool.dylib
+          otool -L ZZZZZZVideoStarTool.dylib
+          ls -lh ZZZZZZVideoStarTool.dylib
 
-      - name: Compile VideoStarTool.dylib
-        env:
-          THEOS: /Users/runner/theos
-        run: |
-          make clean
-          make package FINALPACKAGE=1
-          mkdir -p output
-          find .theos/obj -name "*.dylib" -exec cp {} output/VideoStarTool.dylib \;
-          find packages -name "*.deb" -exec cp {} output/ \; 2>/dev/null || true
-
-      - name: Upload Artifact
+      - name: Upload dylib artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VideoStarTool-Output
-          path: output/
+          name: ZZZZZZVideoStarTool
+          path: ZZZZZZVideoStarTool.dylib
