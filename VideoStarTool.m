@@ -1,7 +1,7 @@
 //
 //  VideoStarTool.m
-//  Single-file Objective-C Tweak -> Build ra VideoStarTool.dylib
-//  Target: iOS 14.0+ (arm64), ARC, không cần Logos (.xm)
+//  Single-file Objective-C Tweak -> Build ra VideoStarTool.dylib / ZZZZZZVideoStarTool.dylib
+//  Target: iOS 14.0+ (arm64), ARC, đã sửa lỗi ARC getter naming (imgCopyBtn)
 //
 
 #import <Foundation/Foundation.h>
@@ -134,7 +134,7 @@ typedef NS_ENUM(NSInteger, VSF4State) {
 @property (nonatomic, strong) UILabel *countLbl;
 @property (nonatomic, strong) UIButton *plusBtn;
 @property (nonatomic, strong) UIButton *startBtn;
-@property (nonatomic, strong) UIButton *copyBtn;
+@property (nonatomic, strong) UIButton *imgCopyBtn;
 
 @property (nonatomic, assign) VSScreenMode mode;
 @property (nonatomic, assign) NSInteger selectedSegments;
@@ -170,7 +170,7 @@ typedef NS_ENUM(NSInteger, VSF4State) {
 - (void)setupViewsIfNeeded {
     if (self.pillView) return;
 
-    UIView *pill = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 218, 34)];
+    UIView *pill = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 222, 34)];
     pill.backgroundColor = [[UIColor colorWithRed:0.08 green:0.09 blue:0.13 alpha:1.0] colorWithAlphaComponent:0.92];
     pill.layer.cornerRadius = 17.0;
     pill.layer.borderWidth = 1.0;
@@ -225,7 +225,7 @@ typedef NS_ENUM(NSInteger, VSF4State) {
     self.countLbl = lbl;
     self.plusBtn = plus;
     self.startBtn = start;
-    self.copyBtn = copy;
+    self.imgCopyBtn = copy;
 }
 
 - (void)showMode:(VSScreenMode)mode inWindow:(nullable UIWindow *)window anchorView:(nullable UIView *)anchorView {
@@ -253,7 +253,7 @@ typedef NS_ENUM(NSInteger, VSF4State) {
             self.minusBtn.hidden = YES;
             self.countLbl.hidden = YES;
             self.plusBtn.hidden = YES;
-            self.copyBtn.hidden = YES;
+            self.imgCopyBtn.hidden = YES;
 
             width = 108.0;
             self.pillView.layer.borderColor = VSColorCyan().CGColor;
@@ -264,7 +264,7 @@ typedef NS_ENUM(NSInteger, VSF4State) {
             self.minusBtn.hidden = NO;
             self.countLbl.hidden = NO;
             self.plusBtn.hidden = NO;
-            self.copyBtn.hidden = NO;
+            self.imgCopyBtn.hidden = NO;
 
             width = 222.0;
             self.minusBtn.frame = CGRectMake(4, 2, 24, 30);
@@ -272,7 +272,7 @@ typedef NS_ENUM(NSInteger, VSF4State) {
             self.countLbl.text = [NSString stringWithFormat:@"%ldđ", (long)self.selectedSegments];
             self.plusBtn.frame = CGRectMake(62, 2, 24, 30);
             self.startBtn.frame = CGRectMake(88, 4, 96, height - 8);
-            self.copyBtn.frame = CGRectMake(188, 4, 30, height - 8);
+            self.imgCopyBtn.frame = CGRectMake(188, 4, 30, height - 8);
             [self refreshRunningState];
         }
 
