@@ -1623,13 +1623,14 @@ static VSLayerFiller *g_activeFiller = nil;
         case 1: [self copyNext]; break;
         case 2: [self finishWithStop:@"Đã huỷ (chưa chọn media)"]; break;
         case 3: [self finishWithStop:@"Popup mua Pro"]; break;
-        case 4:
+        case 4: {
             // Phát lại không ăn -> bỏ ảnh đã lưu, quay về chọn tay một lần rồi lưu lại
             g_cachedPickResponse = nil;
             self.replaying = NO;
             self.requirePickerOpen = NO;
             VSDispatchAfterMS(100, ^{ [self openPicker]; });
             break;
+        }
         default: [self finishWithStop:@"Quá thời gian chọn media"]; break;
     }
 }
