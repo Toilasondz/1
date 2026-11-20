@@ -1563,22 +1563,72 @@ static VSLayerFiller *g_activeFiller = nil;
     };
 
     g_captureMediaResponse = !canReplay;
-    id response = g_cachedPickResponse;
-    BOOL opened = VSTry(^{
-        if (canReplay) [ed pickedWithClipPickerResponse:response];
-        else [ed pickNewContent];
-    });
-    if (!opened) {
-        g_captureMediaResponse = NO;
-        if (canReplay) {
-            g_cachedPickResponse = nil;
-            VSDispatchAfterMS(100, ^{ [self openPicker]; });
+
+    void (^startPolling)(void) = ^{
+        VSSafePollEditor(self.runId, 120, 1500, [self provider], ^BOOL(id e) {
+            return [self pickConditionOn:e];
+        }, ^(BOOL ok) {
+            [self afterPickWait];
+        });
+    };
+
+    if (!canReplay) {
+        BOOL opened = VSTry(^{ [ed pickNewContent]; });
+        if (!opened) {
+            g_captureMediaResponse = NO;
+            [self finishWithStop:@"Không mở được bảng chọn media"];
             return;
         }
-        [self finishWithStop:@"Không mở được bảng chọn media"];
+        startPolling();
         return;
     }
 
+    // PHÁT LẠI: gọi pickNewContent trước (đúng như đoạn 1, để editor lập ngữ cảnh
+    // "đang chọn media cho lớp nào" và có bảng chọn thật để đóng), đợi bảng chọn hiện,
+    // rồi mới đút lựa chọn đã lưu vào pickedWithClipPickerResponse:.
+    id response = g_cachedPickResponse;
+    BOOL opened = VSTry(^{ [ed pickNewContent]; });
+    if (!opened) {
+        g_cachedPickResponse = nil;
+        g_captureMediaResponse = NO;
+        [self finishWithStop:@"Không mở được bảng chọn media"];
+        return;
+    }
+    startPolling();
+
+    VSSafePollEditor(self.runId, 30, 100, [self provider], ^BOOL(id e) {
+        UIViewController *v = (UIViewController *)e;
+        return v.presentedViewController != nil || v.navigationController.presentedViewController != nil;
+    }, ^(BOOL shown) {
+        if (![self alive] || !shown || !self.replaying) return;   // không hiện -> để timeout 12s xử lý
+        VSDispatchAfterMS(250, ^{
+            if (![self alive] || !self.replaying) return;
+            id e = self.editor;
+            if (!e) return;
+            BOOL fired = VSTry(^{ [e pickedWithClipPickerResponse:response]; });
+            if (!fired) {
+                // Đút lỗi -> bảng chọn đang mở, để người dùng chọn tay và lưu lại
+                g_cachedPickResponse = nil;
+                self.replaying = NO;
+                g_captureMediaResponse = YES;
+            }
+        });
+    });
+}
+
+// Bảng chọn thật đang mở mà phát lại không đóng được -> chờ người dùng chọn tay
+- (void)waitForManualPickOnOpenPicker {
+    g_captureMediaResponse = YES;
+    self.pickOutcome = 0;
+    self.pickerSeenOpen = YES;
+    self.pickerConfirmed = NO;
+    self.pickerClosedAt = 0;
+    __weak VSLayerFiller *wSelf = self;
+    g_onLayerAddedHandler = ^(id sender) {
+        VSLayerFiller *s = wSelf;
+        if (!s || sender != s.editor) return;
+        s.pickerConfirmed = YES;
+    };
     VSSafePollEditor(self.runId, 120, 1500, [self provider], ^BOOL(id e) {
         return [self pickConditionOn:e];
     }, ^(BOOL ok) {
@@ -1590,6 +1640,8 @@ static VSLayerFiller *g_activeFiller = nil;
     UIViewController *vc = (UIViewController *)ed;
     BOOL open = vc.presentedViewController != nil || vc.navigationController.presentedViewController != nil;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (!VSEditorIsAlive(ed)) { self.pickOutcome = 5; return YES; }
+    if (self.replaying && now - self.pickStartedAt > VS_REPLAY_TIMEOUT) { self.pickOutcome = 4; return YES; }
     if (open) {
         self.pickerSeenOpen = YES;
         self.pickerClosedAt = 0;
@@ -1607,8 +1659,7 @@ static VSLayerFiller *g_activeFiller = nil;
         self.pickOutcome = 1;
         return YES;
     }
-    if (self.replaying && now - self.pickStartedAt > VS_REPLAY_TIMEOUT) { self.pickOutcome = 4; return YES; }
-    if (self.pickerSeenOpen) {
+    if (self.pickerSeenOpen && !self.replaying) {
         if (self.pickerClosedAt == 0) self.pickerClosedAt = now;
         if (now - self.pickerClosedAt > 2.5) { self.pickOutcome = 2; return YES; }
     }
@@ -1624,13 +1675,18 @@ static VSLayerFiller *g_activeFiller = nil;
         case 2: [self finishWithStop:@"Đã huỷ (chưa chọn media)"]; break;
         case 3: [self finishWithStop:@"Popup mua Pro"]; break;
         case 4: {
-            // Phát lại không ăn -> bỏ ảnh đã lưu, quay về chọn tay một lần rồi lưu lại
+            // Phát lại không ăn -> bỏ ảnh đã lưu, chọn tay một lần rồi lưu lại
             g_cachedPickResponse = nil;
             self.replaying = NO;
             self.requirePickerOpen = NO;
-            VSDispatchAfterMS(100, ^{ [self openPicker]; });
+            [[VSTool shared] updateStatusHUD:@"Dùng lại ảnh không được, chọn tay 1 lần…"];
+            UIViewController *vc = (UIViewController *)self.editor;
+            BOOL pickerStillOpen = vc.presentedViewController != nil || vc.navigationController.presentedViewController != nil;
+            if (pickerStillOpen) VSDispatchAfterMS(100, ^{ [self waitForManualPickOnOpenPicker]; });
+            else VSDispatchAfterMS(100, ^{ [self openPicker]; });
             break;
         }
+        case 5: [self finishWithStop:@"Editor tự đóng khi dùng lại ảnh"]; break;
         default: [self finishWithStop:@"Quá thời gian chọn media"]; break;
     }
 }
