@@ -1,16 +1,15 @@
 // ============================================================================
-// VideoStarTool.m — Video Star 14.3.3 (build 1809) — v5.4
+// VideoStarTool.m — Video Star 14.3.3 (build 1809) — v5.5
 //
-// CẬP NHẬT v5.4:
-//   - Chức năng 4: chọn ảnh/video MỘT LẦN ở đoạn đầu. Các đoạn sau tự dùng lại
-//     đúng ảnh đó (hook pickedWithClipPickerResponse: lưu lại lựa chọn, đoạn sau
-//     phát lại, không mở bảng chọn ảnh). Phát lại lỗi -> tự quay về chọn tay.
-//   - Bấm "Bắt đầu" -> mở thẳng kho ảnh để chọn QR, bỏ bảng liệt kê phân cảnh.
-//     Chọn xong tự đọc code, tự chạy toàn bộ các đoạn.
-//   - Vá crash khi chạy xong: bỏ kiểu block tự giải phóng chính nó
-//     (step = nil / finish) -> chuyển sang đối tượng VSSceneBatchRunner,
-//     VSQRBatchImporter. Chạy xong luôn hiện thông báo "Đã nhập xong N/M đoạn".
-//   - Giao diện bảng chọn/tiến trình: nền xám, chữ trắng, nút xanh, cơ bản.
+// CẬP NHẬT v5.5:
+//   - Giao diện mới nền tím đậm + hồng pastel phát sáng (#FF9FCA), nút bo tròn
+//     dạng pill (đồng bộ cho Menu, Thông báo, Bảng chọn phân cảnh, Tiến trình, HUD).
+//   - Đổi cách mở/đóng menu từ chạm 3 ngón 2 lần sang nút nổi hình Hello Kitty
+//     đã xoá nền (kéo thả tự do trên màn hình, chạm để mở/đóng menu).
+//   - Fix chức năng 4: sau khi chọn ảnh/video ở đoạn 1, từ đoạn 2 trở đi tự động
+//     nhập ngầm đúng ảnh đó (gọi thẳng pickedWithClipPickerResponse: kèm chặn
+//     đóng editor), không hiện lại bảng chọn ảnh. Nếu lỗi -> tự quay về chọn tay.
+//   - Ẩn hoàn toàn thanh trạng thái hệ thống (giờ, Wi-Fi, sóng, pin) khi ở trong app.
 // ============================================================================
 
 #import <UIKit/UIKit.h>
@@ -26,7 +25,7 @@
 #define VS_MAX_LAYERS 40
 #define VS_MIN_FREE_MB 200
 #define VS_COPY_CONFIRM_TIMEOUT 10.0
-#define VS_REPLAY_TIMEOUT 12.0
+#define VS_REPLAY_TIMEOUT 6.0
 #define VSLog(...) ((void)0)
 
 typedef id (^VSObjProvider)(void);
@@ -173,6 +172,7 @@ static BOOL g_dismissLayerMenu = NO;
 static BOOL g_vsaAutomating = NO;
 static id g_cachedPickResponse = nil;            // Lựa chọn ảnh của đoạn đầu, dùng lại cho các đoạn sau
 static BOOL g_captureMediaResponse = NO;         // Đang chờ người dùng chọn ảnh thật -> lưu lại
+static BOOL g_silentMediaReplay = NO;            // Đang nhập ngầm ảnh đã lưu (chặn đóng editor khi không có picker)
 static const void *kVSMenuDismissedKey = &kVSMenuDismissedKey;
 static const void *kVSPopupHandledKey = &kVSPopupHandledKey;
 static NSHashTable *g_activePopupsTable = nil;
@@ -408,6 +408,24 @@ static UIViewController *VSFindTopViewControllerNamed(NSString *className) {
         if (found) return found;
     }
     return nil;
+}
+
+static void VSRefreshStatusBarHiddenEverywhere(void) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    VSTry(^{
+        [[UIApplication sharedApplication] setStatusBarHidden:YES withAnimation:UIStatusBarAnimationNone];
+    });
+#pragma clang diagnostic pop
+    for (UIWindow *w in VSAllWindows()) {
+        UIViewController *vc = w.rootViewController;
+        if (vc) VSTry(^{ [vc setNeedsStatusBarAppearanceUpdate]; });
+        UIViewController *presented = vc.presentedViewController;
+        while (presented) {
+            VSTry(^{ [presented setNeedsStatusBarAppearanceUpdate]; });
+            presented = presented.presentedViewController;
+        }
+    }
 }
 
 // ============================================================================
@@ -765,7 +783,7 @@ static NSString *VSDecodeQRCodeMessageFromImage(UIImage *image) {
 }
 
 // ============================================================================
-// HOOKS
+// HOOKS (bao gồm ẩn thanh trạng thái & chặn đóng editor khi nhập ngầm)
 // ============================================================================
 
 static IMP g_origSelectedCodeWithImageData = NULL;
@@ -779,6 +797,13 @@ static IMP g_origConfirmOverwrite2 = NULL;
 static IMP g_origEditorMemWarn = NULL;
 static IMP g_origNavMemWarn = NULL;
 static IMP g_origPickedResponse = NULL;
+static IMP g_origDismissVC = NULL;
+static IMP g_origPrefersStatusBarHidden = NULL;
+static IMP g_origChildForStatusBarHidden = NULL;
+static IMP g_origVCViewWillAppear = NULL;
+static IMP g_origAppStatusBarHidden = NULL;
+static IMP g_origAppSetStatusBarHidden = NULL;
+static IMP g_origAppSetStatusBarHiddenAnim = NULL;
 
 static NSUInteger g_presetImportEventCounter = 0;
 
@@ -797,6 +822,16 @@ static BOOL VSRobustSwizzleMethod(NSString *className, SEL selector, id blockImp
     return YES;
 }
 
+static void VSForceStatusBarHiddenOnClass(NSString *className) {
+    Class cls = NSClassFromString(className);
+    if (!cls) return;
+    SEL sel = @selector(prefersStatusBarHidden);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    IMP alwaysYes = imp_implementationWithBlock(^BOOL(id __unused selfObj) { return YES; });
+    class_replaceMethod(cls, sel, alwaysYes, method_getTypeEncoding(m));
+}
+
 static void VSNotifyLayerAdded(id sender) {
     void (^handler)(id) = g_onLayerAddedHandler;
     if (!handler) return;
@@ -808,13 +843,58 @@ static void VSInstallCoreHooksOnce(void) {
     dispatch_once(&onceToken, ^{
         g_activePopupsTable = [NSHashTable weakObjectsHashTable];
 
+        // Ẩn thanh trạng thái (giờ, Wi-Fi, sóng, pin) hoàn toàn trong app
+        VSRobustSwizzleMethod(@"UIViewController", @selector(prefersStatusBarHidden), ^BOOL(id __unused selfVC) {
+            return YES;
+        }, &g_origPrefersStatusBarHidden);
+
+        VSRobustSwizzleMethod(@"UIViewController", @selector(childViewControllerForStatusBarHidden), ^UIViewController *(id __unused selfVC) {
+            return nil;
+        }, &g_origChildForStatusBarHidden);
+
+        VSRobustSwizzleMethod(@"UIViewController", @selector(viewWillAppear:), ^(UIViewController *selfVC, BOOL animated) {
+            if (g_origVCViewWillAppear)
+                ((void (*)(id, SEL, BOOL))g_origVCViewWillAppear)(selfVC, @selector(viewWillAppear:), animated);
+            [selfVC setNeedsStatusBarAppearanceUpdate];
+        }, &g_origVCViewWillAppear);
+
+        for (NSString *vcClass in @[@"UINavigationController", @"UITabBarController",
+                                    @"VideoReviewEditVC", @"MultiLayerWizEffectVC", @"MultiLayerNavController"]) {
+            VSForceStatusBarHiddenOnClass(vcClass);
+        }
+
+        VSRobustSwizzleMethod(@"UIApplication", @selector(isStatusBarHidden), ^BOOL(id __unused selfApp) {
+            return YES;
+        }, &g_origAppStatusBarHidden);
+
+        VSRobustSwizzleMethod(@"UIApplication", @selector(setStatusBarHidden:), ^(id selfApp, BOOL __unused hidden) {
+            if (g_origAppSetStatusBarHidden)
+                ((void (*)(id, SEL, BOOL))g_origAppSetStatusBarHidden)(selfApp, @selector(setStatusBarHidden:), YES);
+        }, &g_origAppSetStatusBarHidden);
+
+        VSRobustSwizzleMethod(@"UIApplication", @selector(setStatusBarHidden:withAnimation:), ^(id selfApp, BOOL __unused hidden, UIStatusBarAnimation anim) {
+            if (g_origAppSetStatusBarHiddenAnim)
+                ((void (*)(id, SEL, BOOL, UIStatusBarAnimation))g_origAppSetStatusBarHiddenAnim)(selfApp, @selector(setStatusBarHidden:withAnimation:), YES, anim);
+        }, &g_origAppSetStatusBarHiddenAnim);
+
+        // Chặn editor tự đóng khi gọi thẳng pickedWithClipPickerResponse: mà không mở picker
+        VSRobustSwizzleMethod(@"UIViewController", @selector(dismissViewControllerAnimated:completion:), ^(UIViewController *selfVC, BOOL flag, void (^completion)(void)) {
+            if (g_silentMediaReplay && selfVC.presentedViewController == nil &&
+                (VSSafeIsClass(selfVC, @"MultiLayerWizEffectVC") || VSSafeIsClass(selfVC, @"MultiLayerNavController"))) {
+                if (completion) completion();
+                return;
+            }
+            if (g_origDismissVC)
+                ((void (*)(id, SEL, BOOL, void (^)(void)))g_origDismissVC)(selfVC, @selector(dismissViewControllerAnimated:completion:), flag, completion);
+        }, &g_origDismissVC);
+
         VSRobustSwizzleMethod(@"QRCodeManager", @selector(selectedCode:withImageData:), ^(id selfInstance, id code, id imageData) {
             VSPersistQRCodeImageData(imageData);
             if (g_origSelectedCodeWithImageData)
                 ((void (*)(id, SEL, id, id))g_origSelectedCodeWithImageData)(selfInstance, @selector(selectedCode:withImageData:), code, imageData);
         }, &g_origSelectedCodeWithImageData);
 
-        // Lưu lại lựa chọn ảnh của đoạn đầu để các đoạn sau phát lại, không phải chọn lại
+        // Lưu lại lựa chọn ảnh của đoạn đầu để các đoạn sau nhập ngầm, không mở lại bảng chọn
         VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(pickedWithClipPickerResponse:), ^(id selfInstance, id response) {
             if (g_captureMediaResponse && response) g_cachedPickResponse = response;
             if (g_origPickedResponse)
@@ -899,11 +979,89 @@ static void VSInstallCoreHooksOnce(void) {
             g_memoryWarningAt = CFAbsoluteTimeGetCurrent();
             if (g_origNavMemWarn) ((void (*)(id, SEL))g_origNavMemWarn)(selfInstance, @selector(didReceiveMemoryWarning));
         }, &g_origNavMemWarn);
+
+        VSRefreshStatusBarHiddenEverywhere();
     });
 }
 
 // ============================================================================
-// UI: PREVIEW QR, PROXY QR, WINDOW, MENU
+// BẢNG MÀU TÍM ĐẬM + HỒNG PASTEL & ICON NÚT NỔI HELLO KITTY (ĐÃ XOÁ NỀN)
+// ============================================================================
+
+static inline UIColor *VSToolPinkAccent(void) {
+    return [UIColor colorWithRed:1.000 green:0.624 blue:0.792 alpha:1.0]; // #FF9FCA
+}
+
+static inline UIColor *VSToolCardTopColor(void) {
+    return [UIColor colorWithRed:0.165 green:0.094 blue:0.235 alpha:0.98]; // #2A183C
+}
+
+static inline UIColor *VSToolCardBottomColor(void) {
+    return [UIColor colorWithRed:0.094 green:0.051 blue:0.141 alpha:0.98]; // #180D24
+}
+
+static inline UIColor *VSToolCardBackgroundColor(void) {
+    return [UIColor colorWithRed:0.133 green:0.075 blue:0.196 alpha:0.96];
+}
+
+static inline UIColor *VSToolSubtitleColor(void) {
+    return [UIColor colorWithRed:0.86 green:0.80 blue:0.90 alpha:0.80];
+}
+
+static inline UIColor *VSToolPillTextColor(void) {
+    return [UIColor colorWithRed:0.094 green:0.051 blue:0.141 alpha:1.0];
+}
+
+static UIImage *VSFloatingButtonIconImage(void) {
+    static UIImage *img = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSString *b64 =
+            @"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";
+        NSData *data = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
+        if (data.length) img = [UIImage imageWithData:data scale:3.0];
+    });
+    return img;
+}
+
+static CAGradientLayer *VSMakePlumGradient(CGRect frame, CGFloat corner) {
+    CAGradientLayer *g = [CAGradientLayer layer];
+    g.frame = frame;
+    g.cornerRadius = corner;
+    g.masksToBounds = YES;
+    g.colors = @[(id)VSToolCardTopColor().CGColor, (id)VSToolCardBottomColor().CGColor];
+    g.startPoint = CGPointMake(0.5, 0.0);
+    g.endPoint = CGPointMake(0.5, 1.0);
+    return g;
+}
+
+static UIButton *VSToolCreatePillButton(NSString *title, CGRect frame, BOOL primary) {
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+    btn.frame = frame;
+    btn.layer.cornerRadius = frame.size.height / 2.0;
+    [btn setTitle:title forState:UIControlStateNormal];
+    if (primary) {
+        btn.backgroundColor = VSToolPinkAccent();
+        [btn setTitleColor:VSToolPillTextColor() forState:UIControlStateNormal];
+        [btn setTitleColor:[VSToolPillTextColor() colorWithAlphaComponent:0.45] forState:UIControlStateDisabled];
+        btn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightBold];
+        btn.layer.shadowColor = VSToolPinkAccent().CGColor;
+        btn.layer.shadowOpacity = 0.48;
+        btn.layer.shadowRadius = 12.0;
+        btn.layer.shadowOffset = CGSizeMake(0, 2);
+    } else {
+        btn.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
+        btn.layer.borderWidth = 1.0;
+        btn.layer.borderColor = [VSToolPinkAccent() colorWithAlphaComponent:0.32].CGColor;
+        [btn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        [btn setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.4] forState:UIControlStateDisabled];
+        btn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    }
+    return btn;
+}
+
+// ============================================================================
+// UI: WINDOW, PREVIEW QR, PROXY QR, CUSTOM ALERT
 // ============================================================================
 
 @interface VSToolPassThroughWindow : UIWindow
@@ -915,35 +1073,17 @@ static void VSInstallCoreHooksOnce(void) {
 }
 @end
 
-static inline UIColor *VSToolAccentColor(void) { return [UIColor colorWithRed:0.86 green:0.71 blue:0.42 alpha:1.0]; }
-
-// Giao diện cơ bản cho bảng chọn phân cảnh / tiến trình
-static inline UIColor *VSBasicBlue(void) { return [UIColor colorWithRed:0.04 green:0.52 blue:1.0 alpha:1.0]; }
-static inline UIColor *VSToolCardBackgroundColor(void) { return [UIColor colorWithWhite:0.11 alpha:0.97]; }
-
-static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
-    btn.frame = frame;
-    btn.layer.cornerRadius = 8.0;
-    btn.layer.borderWidth = 1.0;
-    btn.layer.borderColor = VSBasicBlue().CGColor;
-    [btn setTitle:title forState:UIControlStateNormal];
-    [btn setTitleColor:VSBasicBlue() forState:UIControlStateNormal];
-    [btn setTitleColor:[VSBasicBlue() colorWithAlphaComponent:0.35] forState:UIControlStateDisabled];
-    btn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
-    return btn;
-}
-
 @interface VSToolQRCodePreviewVC : UIViewController
 @property (nonatomic, strong) UIImage *qrImage;
 @end
 @implementation VSToolQRCodePreviewVC
+- (BOOL)prefersStatusBarHidden { return YES; }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.90];
+    self.view.backgroundColor = VSToolCardBottomColor();
     UIImageView *iv = [[UIImageView alloc] initWithImage:self.qrImage];
     iv.contentMode = UIViewContentModeScaleAspectFit;
-    iv.layer.cornerRadius = 14; iv.clipsToBounds = YES;
+    iv.layer.cornerRadius = 18; iv.clipsToBounds = YES;
     iv.frame = CGRectInset(self.view.bounds, 24, 110);
     iv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:iv];
@@ -951,21 +1091,21 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
     title.text = @"Code gần nhất đã nhập";
     title.textColor = UIColor.whiteColor;
     title.textAlignment = NSTextAlignmentCenter;
-    title.font = [UIFont boldSystemFontOfSize:18];
+    title.font = [UIFont boldSystemFontOfSize:19];
     title.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     [self.view addSubview:title];
-    CGFloat w = (self.view.bounds.size.width - 48) / 2.0;
-    NSArray *titles = @[@"Đóng", @"Chia sẻ / Lưu"];
-    for (NSUInteger i = 0; i < 2; i++) {
-        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        b.frame = CGRectMake(24 + i * (w + 12), self.view.bounds.size.height - 84, w - 6, 44);
-        b.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleWidth;
-        [b setTitle:titles[i] forState:UIControlStateNormal];
-        b.titleLabel.font = [UIFont boldSystemFontOfSize:16];
-        b.tag = (NSInteger)i;
-        [b addTarget:self action:@selector(tapped:) forControlEvents:UIControlEventTouchUpInside];
-        [self.view addSubview:b];
-    }
+    CGFloat w = (self.view.bounds.size.width - 60) / 2.0;
+    UIButton *closeBtn = VSToolCreatePillButton(@"ĐÓNG", CGRectMake(24, self.view.bounds.size.height - 86, w, 46), NO);
+    closeBtn.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleWidth;
+    closeBtn.tag = 0;
+    [closeBtn addTarget:self action:@selector(tapped:) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:closeBtn];
+
+    UIButton *shareBtn = VSToolCreatePillButton(@"CHIA SẺ / LƯU", CGRectMake(24 + w + 12, self.view.bounds.size.height - 86, w, 46), YES);
+    shareBtn.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleWidth;
+    shareBtn.tag = 1;
+    [shareBtn addTarget:self action:@selector(tapped:) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:shareBtn];
 }
 - (void)tapped:(UIButton *)button {
     if (button.tag == 0) { [self dismissViewControllerAnimated:YES completion:nil]; return; }
@@ -1006,6 +1146,117 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 }
 @end
 
+// Thông báo kiểu nền tím đậm + vòng tròn icon hồng phát sáng + nút pill XONG
+@interface VSToolAlertView : UIView
+- (instancetype)initWithFrame:(CGRect)frame title:(NSString *)title message:(NSString *)message iconText:(NSString *)iconText buttonTitle:(NSString *)buttonTitle;
+- (void)showAnimated;
+- (void)dismissAnimated;
+@end
+
+@implementation VSToolAlertView {
+    UIView *_card;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame title:(NSString *)title message:(NSString *)message iconText:(NSString *)iconText buttonTitle:(NSString *)buttonTitle {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    self.backgroundColor = [UIColor colorWithRed:0.06 green:0.03 blue:0.10 alpha:0.56];
+    self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+
+    CGFloat W = frame.size.width;
+    CGFloat cardW = MIN(W - 44.0, 340.0);
+    CGFloat pad = 22.0;
+    CGFloat cw = cardW - pad * 2.0;
+
+    _card = [[UIView alloc] initWithFrame:CGRectMake(0, 0, cardW, 200)];
+    _card.layer.cornerRadius = 26.0;
+    _card.layer.borderWidth = 1.0;
+    _card.layer.borderColor = [VSToolPinkAccent() colorWithAlphaComponent:0.25].CGColor;
+    _card.layer.shadowColor = UIColor.blackColor.CGColor;
+    _card.layer.shadowOpacity = 0.65;
+    _card.layer.shadowRadius = 26.0;
+    _card.layer.shadowOffset = CGSizeMake(0, 14);
+    _card.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
+                             UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
+    [self addSubview:_card];
+
+    CGFloat y = 26.0;
+    CGFloat badgeSize = 58.0;
+    UIView *badge = [[UIView alloc] initWithFrame:CGRectMake((cardW - badgeSize) / 2.0, y, badgeSize, badgeSize)];
+    badge.backgroundColor = VSToolPinkAccent();
+    badge.layer.cornerRadius = badgeSize / 2.0;
+    badge.layer.shadowColor = VSToolPinkAccent().CGColor;
+    badge.layer.shadowOpacity = 0.55;
+    badge.layer.shadowRadius = 14.0;
+    badge.layer.shadowOffset = CGSizeZero;
+    UILabel *iconLbl = [[UILabel alloc] initWithFrame:badge.bounds];
+    iconLbl.text = iconText.length ? iconText : @"!";
+    iconLbl.textColor = VSToolPillTextColor();
+    iconLbl.font = [UIFont systemFontOfSize:28 weight:UIFontWeightBold];
+    iconLbl.textAlignment = NSTextAlignmentCenter;
+    [badge addSubview:iconLbl];
+    [_card addSubview:badge];
+    y += badgeSize + 18.0;
+
+    UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(pad, y, cw, 28)];
+    titleLbl.text = title ?: @"VideoStarTool";
+    titleLbl.textColor = UIColor.whiteColor;
+    titleLbl.font = [UIFont systemFontOfSize:20 weight:UIFontWeightBold];
+    titleLbl.textAlignment = NSTextAlignmentCenter;
+    titleLbl.numberOfLines = 2;
+    CGSize tSize = [titleLbl sizeThatFits:CGSizeMake(cw, 60)];
+    titleLbl.frame = CGRectMake(pad, y, cw, ceil(tSize.height));
+    [_card addSubview:titleLbl];
+    y += titleLbl.frame.size.height + 12.0;
+
+    if (message.length) {
+        UILabel *msgLbl = [[UILabel alloc] initWithFrame:CGRectMake(pad, y, cw, 20)];
+        msgLbl.text = message;
+        msgLbl.textColor = VSToolSubtitleColor();
+        msgLbl.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightRegular];
+        msgLbl.textAlignment = NSTextAlignmentCenter;
+        msgLbl.numberOfLines = 0;
+        CGSize mSize = [msgLbl sizeThatFits:CGSizeMake(cw, 220)];
+        msgLbl.frame = CGRectMake(pad, y, cw, ceil(mSize.height));
+        [_card addSubview:msgLbl];
+        y += msgLbl.frame.size.height + 24.0;
+    } else {
+        y += 14.0;
+    }
+
+    UIButton *okBtn = VSToolCreatePillButton(buttonTitle ?: @"XONG", CGRectMake(pad, y, cw, 48.0), YES);
+    [okBtn addTarget:self action:@selector(dismissAnimated) forControlEvents:UIControlEventTouchUpInside];
+    [_card addSubview:okBtn];
+    y += 48.0 + 22.0;
+
+    _card.frame = CGRectMake(0, 0, cardW, y);
+    _card.center = CGPointMake(W / 2.0, frame.size.height / 2.0);
+    _card.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:_card.bounds cornerRadius:26.0].CGPath;
+    [_card.layer insertSublayer:VSMakePlumGradient(_card.bounds, 26.0) atIndex:0];
+    return self;
+}
+
+- (void)showAnimated {
+    self.alpha = 0.0;
+    _card.transform = CGAffineTransformMakeScale(0.90, 0.90);
+    [UIView animateWithDuration:0.28 delay:0 usingSpringWithDamping:0.82 initialSpringVelocity:0.4
+                        options:UIViewAnimationOptionCurveEaseOut animations:^{
+        self.alpha = 1.0;
+        self->_card.transform = CGAffineTransformIdentity;
+    } completion:nil];
+}
+
+- (void)dismissAnimated {
+    [UIView animateWithDuration:0.18 delay:0 options:UIViewAnimationOptionCurveEaseIn animations:^{
+        self.alpha = 0.0;
+        self->_card.transform = CGAffineTransformMakeScale(0.94, 0.94);
+    } completion:^(BOOL __unused finished) {
+        [self removeFromSuperview];
+    }];
+}
+
+@end
+
 // ============================================================================
 // VSTOOL INTERFACE
 // ============================================================================
@@ -1015,7 +1266,9 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 
 @interface VSTool : NSObject
 @property (nonatomic, strong) VSToolPassThroughWindow *window;
+@property (nonatomic, strong) UIButton *floatingMenuButton;
 @property (nonatomic, strong) UIView *menuView;
+@property (nonatomic, strong) VSToolAlertView *activeAlertView;
 @property (nonatomic, strong) UILabel *statusHUDLabel;
 @property (nonatomic, strong) UIView *bottomActionBar;
 @property (nonatomic, strong) VSToolQRCodeCaptureProxy *qrCaptureProxy;
@@ -1035,19 +1288,18 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 
 + (instancetype)shared;
 - (void)setupToolInterfaceIfNeeded;
+- (void)setupFloatingMenuButton;
+- (void)handleFloatingButtonTap:(UIButton *)sender;
+- (void)handleFloatingButtonPan:(UIPanGestureRecognizer *)pan;
 - (void)restoreOriginalQRCodeDelegate;
 - (void)terminateCurrentTaskQuietly;
 - (void)toggleMenu;
 - (void)showMenu;
 - (void)hideMenuWithCompletion:(void (^)(void))completion;
-- (void)handleMenuGesture:(UIGestureRecognizer *)g;
 - (void)runMenuFeature:(NSInteger)index;
 - (void)stopCurrentTaskFromMenu;
 - (void)presentFromTop:(UIViewController *)controller;
 - (void)presentController:(UIViewController *)controller retry:(BOOL)retry;
-- (void)installMenuGestures;
-- (void)attachMenuGestureToView:(id)object;
-- (void)showMenuHintOnce;
 - (UIViewController *)topPresenterVC;
 - (void)updateStatusHUD:(NSString *)message;
 - (void)showNotificationAlert:(NSString *)message title:(NSString *)title;
@@ -1076,19 +1328,12 @@ static UIButton *VSToolCreateOutlineButton(NSString *title, CGRect frame) {
 @end
 
 // ============================================================================
-// MENU (mở / đóng bằng CHẠM 3 NGÓN 2 LẦN)
+// MENU (mở / đóng bằng NÚT NỔI HELLO KITTY — phong cách Tím Đậm + Hồng Pastel)
 // ============================================================================
 
-static NSString *const kVSMenuGestureName = @"VSToolMenuGesture3x2";
 static const CGFloat kVSMenuCorner = 26.0;
 static const NSInteger kVSMenuTagStop = 100;
 static const NSInteger kVSMenuTagClose = 102;
-
-static inline UIColor *VSMenuChampagne(void) { return [UIColor colorWithRed:0.97 green:0.94 blue:0.87 alpha:1.0]; }
-
-static UIFont *VSMenuDisplayFont(CGFloat size) {
-    return [UIFont fontWithName:@"Didot-Bold" size:size] ?: [UIFont boldSystemFontOfSize:size];
-}
 
 static NSAttributedString *VSLetterSpaced(NSString *text, CGFloat kern, UIColor *color, UIFont *font) {
     return [[NSAttributedString alloc] initWithString:text attributes:@{
@@ -1110,18 +1355,6 @@ static UILabel *VSMenuMakeLabel(CGRect frame, NSString *text, UIFont *font, UICo
     return l;
 }
 
-static CAGradientLayer *VSMakeGoldGradient(CGRect frame, CGFloat corner) {
-    CAGradientLayer *g = [CAGradientLayer layer];
-    g.frame = frame;
-    g.cornerRadius = corner;
-    g.masksToBounds = YES;
-    g.colors = @[(id)[UIColor colorWithRed:1.00 green:0.90 blue:0.64 alpha:1.0].CGColor,
-                 (id)[UIColor colorWithRed:0.66 green:0.48 blue:0.20 alpha:1.0].CGColor];
-    g.startPoint = CGPointMake(0.0, 0.0);
-    g.endPoint = CGPointMake(1.0, 1.0);
-    return g;
-}
-
 static UIView *VSMakeDivider(CGRect frame) {
     UIView *d = [[UIView alloc] initWithFrame:frame];
     d.userInteractionEnabled = NO;
@@ -1129,10 +1362,10 @@ static UIView *VSMakeDivider(CGRect frame) {
     g.frame = CGRectMake(0, 0, frame.size.width, frame.size.height);
     g.startPoint = CGPointMake(0.0, 0.5);
     g.endPoint = CGPointMake(1.0, 0.5);
-    UIColor *gold = VSToolAccentColor();
-    g.colors = @[(id)[gold colorWithAlphaComponent:0.0].CGColor,
-                 (id)gold.CGColor,
-                 (id)[gold colorWithAlphaComponent:0.0].CGColor];
+    UIColor *pink = VSToolPinkAccent();
+    g.colors = @[(id)[pink colorWithAlphaComponent:0.0].CGColor,
+                 (id)[pink colorWithAlphaComponent:0.55].CGColor,
+                 (id)[pink colorWithAlphaComponent:0.0].CGColor];
     [d.layer addSublayer:g];
     return d;
 }
@@ -1144,7 +1377,9 @@ static UIView *VSMakeDivider(CGRect frame) {
     [super setHighlighted:highlighted];
     [UIView animateWithDuration:0.14 delay:0 options:UIViewAnimationOptionAllowUserInteraction animations:^{
         self.transform = highlighted ? CGAffineTransformMakeScale(0.975, 0.975) : CGAffineTransformIdentity;
-        self.backgroundColor = [UIColor colorWithWhite:1.0 alpha:(highlighted ? 0.10 : 0.05)];
+        self.backgroundColor = highlighted
+            ? [VSToolPinkAccent() colorWithAlphaComponent:0.18]
+            : [UIColor colorWithWhite:1.0 alpha:0.06];
     } completion:nil];
 }
 @end
@@ -1153,7 +1388,7 @@ static UIView *VSMakeDivider(CGRect frame) {
 - (void)showAnimated;
 - (void)hideAnimatedWithCompletion:(void (^)(void))completion;
 - (void)buildPanel;
-- (UIButton *)pillWithTitle:(NSString *)title color:(UIColor *)color frame:(CGRect)frame;
+- (UIButton *)pillWithTitle:(NSString *)title frame:(CGRect)frame;
 - (VSToolMenuRowControl *)rowWithIndex:(NSInteger)index title:(NSString *)title subtitle:(NSString *)subtitle frame:(CGRect)frame;
 - (void)haptic;
 - (BOOL)isSingleTouchInArea:(UIView *)area forEvent:(UIEvent *)event;
@@ -1180,7 +1415,7 @@ static UIView *VSMakeDivider(CGRect frame) {
 
     UIControl *dim = [[UIControl alloc] initWithFrame:self.bounds];
     dim.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    dim.backgroundColor = [UIColor colorWithWhite:0 alpha:0.30];
+    dim.backgroundColor = [UIColor colorWithRed:0.07 green:0.03 blue:0.12 alpha:0.42];
     [dim addTarget:self action:@selector(dimTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:dim];
 
@@ -1193,7 +1428,7 @@ static UIView *VSMakeDivider(CGRect frame) {
     BOOL running = tool.currentTaskName.length > 0;
 
     CGFloat W = self.bounds.size.width;
-    CGFloat pw = MIN(W - 40.0, 360.0);
+    CGFloat pw = MIN(W - 40.0, 356.0);
     CGFloat inner = 22.0;
     CGFloat cw = pw - inner * 2.0;
 
@@ -1201,57 +1436,63 @@ static UIView *VSMakeDivider(CGRect frame) {
     _panel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
                               UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
     _panel.layer.borderWidth = 1.0;
-    _panel.layer.borderColor = [VSToolAccentColor() colorWithAlphaComponent:0.45].CGColor;
+    _panel.layer.borderColor = [VSToolPinkAccent() colorWithAlphaComponent:0.28].CGColor;
     _panel.layer.shadowColor = UIColor.blackColor.CGColor;
-    _panel.layer.shadowOpacity = 0.7;
-    _panel.layer.shadowRadius = 30.0;
-    _panel.layer.shadowOffset = CGSizeMake(0, 18);
+    _panel.layer.shadowOpacity = 0.72;
+    _panel.layer.shadowRadius = 28.0;
+    _panel.layer.shadowOffset = CGSizeMake(0, 16);
     [self addSubview:_panel];
 
-    UIFont *kickerFont = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
-    CGFloat y = 20.0;
+    CGFloat y = 22.0;
+    UIImage *kitty = VSFloatingButtonIconImage();
+    if (kitty) {
+        UIImageView *iv = [[UIImageView alloc] initWithImage:kitty];
+        iv.contentMode = UIViewContentModeScaleAspectFit;
+        iv.frame = CGRectMake((pw - 48.0) / 2.0, y, 48.0, 48.0);
+        iv.layer.shadowColor = VSToolPinkAccent().CGColor;
+        iv.layer.shadowOpacity = 0.45;
+        iv.layer.shadowRadius = 10.0;
+        iv.layer.shadowOffset = CGSizeZero;
+        [_panel addSubview:iv];
+        y += 52.0;
+    }
 
-    UILabel *kicker = VSMenuMakeLabel(CGRectMake(inner, y, cw, 14), nil, kickerFont, VSToolAccentColor(), NSTextAlignmentCenter);
-    kicker.attributedText = VSLetterSpaced(@"VIDEO STAR", 3.0, VSToolAccentColor(), kickerFont);
-    [_panel addSubview:kicker];
+    UILabel *title = VSMenuMakeLabel(CGRectMake(inner, y, cw, 28), @"VideoStarTool",
+                                     [UIFont systemFontOfSize:21 weight:UIFontWeightBold], UIColor.whiteColor, NSTextAlignmentCenter);
+    [_panel addSubview:title];
+    y += 30.0;
+
+    UILabel *sub = VSMenuMakeLabel(CGRectMake(inner, y, cw, 16), @"Chạm biểu tượng nổi để mở hoặc đóng menu",
+                                   [UIFont systemFontOfSize:12], VSToolSubtitleColor(), NSTextAlignmentCenter);
+    [_panel addSubview:sub];
     y += 22.0;
 
-    UILabel *title = VSMenuMakeLabel(CGRectMake(inner, y, cw, 32), @"VideoStarTool", VSMenuDisplayFont(25), VSMenuChampagne(), NSTextAlignmentCenter);
-    [_panel addSubview:title];
-    y += 36.0;
-
-    UILabel *sub = VSMenuMakeLabel(CGRectMake(inner, y, cw, 16), @"Chạm 3 ngón 2 lần để mở hoặc đóng menu",
-                                   [UIFont systemFontOfSize:11.5], [UIColor colorWithWhite:1.0 alpha:0.55], NSTextAlignmentCenter);
-    [_panel addSubview:sub];
-    y += 26.0;
-
     [_panel addSubview:VSMakeDivider(CGRectMake(inner, y, cw, 1))];
-    y += 16.0;
+    y += 14.0;
 
-    CGFloat cardH = 56.0;
+    CGFloat cardH = 54.0;
     UIView *card = [[UIView alloc] initWithFrame:CGRectMake(inner, y, cw, cardH)];
-    card.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.04];
+    card.backgroundColor = [VSToolPinkAccent() colorWithAlphaComponent:0.08];
     card.layer.cornerRadius = 16.0;
     card.layer.borderWidth = 1.0;
-    card.layer.borderColor = [VSToolAccentColor() colorWithAlphaComponent:0.22].CGColor;
+    card.layer.borderColor = [VSToolPinkAccent() colorWithAlphaComponent:0.22].CGColor;
     [_panel addSubview:card];
 
-    UIFont *capFont = [UIFont systemFontOfSize:10.5 weight:UIFontWeightSemibold];
-    UILabel *cap = VSMenuMakeLabel(CGRectMake(16, 10, cw - 120, 14), nil, capFont, VSToolAccentColor(), NSTextAlignmentLeft);
+    UIFont *capFont = [UIFont systemFontOfSize:10.5 weight:UIFontWeightBold];
+    UILabel *cap = VSMenuMakeLabel(CGRectMake(16, 9, cw - 116, 14), nil, capFont, VSToolPinkAccent(), NSTextAlignmentLeft);
     if (running) {
-        cap.attributedText = VSLetterSpaced(@"ĐANG CHẠY", 2.0, VSToolAccentColor(), capFont);
-        UILabel *name = VSMenuMakeLabel(CGRectMake(16, 27, cw - 120, 20), tool.currentTaskName,
-                                        [UIFont systemFontOfSize:14 weight:UIFontWeightMedium], [UIColor colorWithWhite:1.0 alpha:0.92], NSTextAlignmentLeft);
+        cap.attributedText = VSLetterSpaced(@"ĐANG CHẠY", 1.8, VSToolPinkAccent(), capFont);
+        UILabel *name = VSMenuMakeLabel(CGRectMake(16, 26, cw - 116, 20), tool.currentTaskName,
+                                        [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold], UIColor.whiteColor, NSTextAlignmentLeft);
         [card addSubview:name];
-        UIButton *stop = [self pillWithTitle:@"Dừng" color:[UIColor colorWithRed:1.0 green:0.56 blue:0.52 alpha:1.0]
-                                       frame:CGRectMake(cw - 16 - 80, (cardH - 32) / 2.0, 80, 32)];
+        UIButton *stop = [self pillWithTitle:@"Dừng" frame:CGRectMake(cw - 14 - 76, (cardH - 32) / 2.0, 76, 32)];
         stop.tag = kVSMenuTagStop;
         [stop addTarget:self action:@selector(menuControlTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
         [card addSubview:stop];
     } else {
-        cap.attributedText = VSLetterSpaced(@"SẴN SÀNG", 2.0, VSToolAccentColor(), capFont);
-        UILabel *hint = VSMenuMakeLabel(CGRectMake(16, 27, cw - 32, 20), @"Chọn một chức năng bên dưới",
-                                        [UIFont systemFontOfSize:13], [UIColor colorWithWhite:1.0 alpha:0.7], NSTextAlignmentLeft);
+        cap.attributedText = VSLetterSpaced(@"SẴN SÀNG", 1.8, VSToolPinkAccent(), capFont);
+        UILabel *hint = VSMenuMakeLabel(CGRectMake(16, 26, cw - 32, 20), @"Chọn một chức năng bên dưới",
+                                        [UIFont systemFontOfSize:13], VSToolSubtitleColor(), NSTextAlignmentLeft);
         [card addSubview:hint];
     }
     [card addSubview:cap];
@@ -1261,7 +1502,7 @@ static UIView *VSMakeDivider(CGRect frame) {
         @[@"Auto nhập ảnh vào các lớp (x10)", @"Chọn 1 ảnh/video, copy siêu nhanh sang các lớp còn lại"],
         @[@"Hiển thị code gần nhất", @"Xem lại mã QR vừa nhập"],
         @[@"Auto chia beat", @"Tự chia phân cảnh theo nhịp"],
-        @[@"Auto nhập code + ảnh vào phân cảnh", @"Chọn ảnh 1 lần, dùng chung cho mọi đoạn"]
+        @[@"Auto nhập code + ảnh vào phân cảnh", @"Chọn ảnh 1 lần ở đoạn 1, đoạn sau tự nhập ngầm"]
     ];
     CGFloat rowH = 54.0, gap = 8.0;
     for (NSUInteger i = 0; i < items.count; i++) {
@@ -1271,82 +1512,72 @@ static UIView *VSMakeDivider(CGRect frame) {
         [_panel addSubview:row];
         y += rowH + gap;
     }
-    y += 4.0;
+    y += 8.0;
 
-    UIButton *close = [UIButton buttonWithType:UIButtonTypeCustom];
-    close.frame = CGRectMake(inner, y, cw, 44);
-    close.layer.cornerRadius = 14.0;
-    close.layer.borderWidth = 1.0;
-    close.layer.borderColor = VSToolAccentColor().CGColor;
-    [close setTitle:@"Đóng" forState:UIControlStateNormal];
-    [close setTitleColor:VSToolAccentColor() forState:UIControlStateNormal];
-    close.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    UIButton *close = VSToolCreatePillButton(@"XONG", CGRectMake(inner, y, cw, 46), YES);
     close.tag = kVSMenuTagClose;
     [close addTarget:self action:@selector(menuControlTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
     [_panel addSubview:close];
-    y += 44.0 + 22.0;
+    y += 46.0 + 22.0;
 
     CGFloat ph = y;
     _panel.frame = CGRectMake(0, 0, pw, ph);
     _panel.center = CGPointMake(W / 2.0, self.bounds.size.height / 2.0);
     _panel.layer.cornerRadius = kVSMenuCorner;
     _panel.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:_panel.bounds cornerRadius:kVSMenuCorner].CGPath;
-
-    CAGradientLayer *bg = [CAGradientLayer layer];
-    bg.frame = CGRectInset(_panel.bounds, 1.0, 1.0);
-    bg.cornerRadius = kVSMenuCorner - 1.0;
-    bg.masksToBounds = YES;
-    bg.colors = @[(id)[UIColor colorWithRed:0.12 green:0.105 blue:0.09 alpha:1.0].CGColor,
-                  (id)[UIColor colorWithRed:0.035 green:0.035 blue:0.045 alpha:1.0].CGColor];
-    bg.startPoint = CGPointMake(0.5, 0.0);
-    bg.endPoint = CGPointMake(0.5, 1.0);
-    [_panel.layer insertSublayer:bg atIndex:0];
+    [_panel.layer insertSublayer:VSMakePlumGradient(_panel.bounds, kVSMenuCorner) atIndex:0];
 }
 
-- (UIButton *)pillWithTitle:(NSString *)title color:(UIColor *)color frame:(CGRect)frame {
+- (UIButton *)pillWithTitle:(NSString *)title frame:(CGRect)frame {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
     b.frame = frame;
+    b.backgroundColor = VSToolPinkAccent();
     b.layer.cornerRadius = frame.size.height / 2.0;
-    b.layer.borderWidth = 1.0;
-    b.layer.borderColor = [color colorWithAlphaComponent:0.7].CGColor;
+    b.layer.shadowColor = VSToolPinkAccent().CGColor;
+    b.layer.shadowOpacity = 0.45;
+    b.layer.shadowRadius = 8.0;
+    b.layer.shadowOffset = CGSizeZero;
     [b setTitle:title forState:UIControlStateNormal];
-    [b setTitleColor:color forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    [b setTitleColor:VSToolPillTextColor() forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightBold];
     return b;
 }
 
 - (VSToolMenuRowControl *)rowWithIndex:(NSInteger)index title:(NSString *)title subtitle:(NSString *)subtitle frame:(CGRect)frame {
     VSToolMenuRowControl *row = [[VSToolMenuRowControl alloc] initWithFrame:frame];
     row.tag = index;
-    row.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.05];
+    row.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.06];
     row.layer.cornerRadius = 16.0;
     row.layer.borderWidth = 1.0;
-    row.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.08].CGColor;
+    row.layer.borderColor = [VSToolPinkAccent() colorWithAlphaComponent:0.16].CGColor;
     row.autoresizingMask = UIViewAutoresizingFlexibleWidth;
 
-    CGFloat d = 36.0;
-    UIView *badge = [[UIView alloc] initWithFrame:CGRectMake(14, (frame.size.height - d) / 2.0, d, d)];
+    CGFloat d = 34.0;
+    UIView *badge = [[UIView alloc] initWithFrame:CGRectMake(12, (frame.size.height - d) / 2.0, d, d)];
     badge.userInteractionEnabled = NO;
+    badge.backgroundColor = VSToolPinkAccent();
     badge.layer.cornerRadius = d / 2.0;
-    badge.clipsToBounds = YES;
-    [badge.layer insertSublayer:VSMakeGoldGradient(CGRectMake(0, 0, d, d), d / 2.0) atIndex:0];
+    badge.layer.shadowColor = VSToolPinkAccent().CGColor;
+    badge.layer.shadowOpacity = 0.45;
+    badge.layer.shadowRadius = 7.0;
+    badge.layer.shadowOffset = CGSizeZero;
     UILabel *num = VSMenuMakeLabel(CGRectMake(0, 0, d, d), [NSString stringWithFormat:@"%ld", (long)index],
-                                   VSMenuDisplayFont(17), [UIColor colorWithRed:0.10 green:0.07 blue:0.03 alpha:1.0],
+                                   [UIFont systemFontOfSize:15 weight:UIFontWeightBold], VSToolPillTextColor(),
                                    NSTextAlignmentCenter);
     [badge addSubview:num];
     [row addSubview:badge];
 
-    CGFloat tx = 14.0 + d + 14.0;
-    CGFloat tw = frame.size.width - tx - 40.0;
-    UILabel *t = VSMenuMakeLabel(CGRectMake(tx, 10, tw, 20), title,
-                                 [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold], VSMenuChampagne(), NSTextAlignmentLeft);
+    CGFloat tx = 12.0 + d + 12.0;
+    CGFloat tw = frame.size.width - tx - 34.0;
+    UILabel *t = VSMenuMakeLabel(CGRectMake(tx, 9, tw, 20), title,
+                                 [UIFont systemFontOfSize:14.5 weight:UIFontWeightSemibold], UIColor.whiteColor, NSTextAlignmentLeft);
     UILabel *s = VSMenuMakeLabel(CGRectMake(tx, 30, tw, 16), subtitle,
-                                 [UIFont systemFontOfSize:11.5], [UIColor colorWithWhite:1.0 alpha:0.5], NSTextAlignmentLeft);
+                                 [UIFont systemFontOfSize:11.5], VSToolSubtitleColor(), NSTextAlignmentLeft);
     [row addSubview:t];
     [row addSubview:s];
 
-    UILabel *chev = VSMenuMakeLabel(CGRectMake(frame.size.width - 34, (frame.size.height - 26) / 2.0, 20, 26), @"›",
-                                    [UIFont systemFontOfSize:24 weight:UIFontWeightLight], VSToolAccentColor(), NSTextAlignmentCenter);
+    UILabel *chev = VSMenuMakeLabel(CGRectMake(frame.size.width - 30, (frame.size.height - 26) / 2.0, 18, 26), @"›",
+                                    [UIFont systemFontOfSize:22 weight:UIFontWeightMedium], VSToolPinkAccent(), NSTextAlignmentCenter);
     chev.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
     [row addSubview:chev];
     return row;
@@ -1355,7 +1586,7 @@ static UIView *VSMakeDivider(CGRect frame) {
 - (void)showAnimated {
     self.alpha = 0.0;
     _panel.transform = CGAffineTransformMakeScale(0.92, 0.92);
-    [UIView animateWithDuration:0.35 delay:0 usingSpringWithDamping:0.82 initialSpringVelocity:0.4
+    [UIView animateWithDuration:0.32 delay:0 usingSpringWithDamping:0.82 initialSpringVelocity:0.4
                         options:UIViewAnimationOptionCurveEaseOut animations:^{
         self.alpha = 1.0;
         self->_panel.transform = CGAffineTransformIdentity;
@@ -1365,8 +1596,8 @@ static UIView *VSMakeDivider(CGRect frame) {
 - (void)hideAnimatedWithCompletion:(void (^)(void))completion {
     [UIView animateWithDuration:0.2 delay:0 options:UIViewAnimationOptionCurveEaseIn animations:^{
         self.alpha = 0.0;
-        self->_panel.transform = CGAffineTransformMakeScale(0.96, 0.96);
-    } completion:^(BOOL finished) {
+        self->_panel.transform = CGAffineTransformMakeScale(0.95, 0.95);
+    } completion:^(BOOL __unused finished) {
         [self removeFromSuperview];
         if (completion) completion();
     }];
@@ -1411,7 +1642,7 @@ static UIView *VSMakeDivider(CGRect frame) {
 @end
 
 // ============================================================================
-// NHẬP MEDIA: PICKER + PHÁT LẠI LỰA CHỌN + COPY SIÊU TỐC X10
+// NHẬP MEDIA: PICKER (ĐOẠN 1) + NHẬP NGẦM KHÔNG MỞ PICKER (ĐOẠN 2+) + COPY X10
 // ============================================================================
 
 static NSString *VSFillSummary(NSUInteger copied, NSUInteger targets, NSArray<NSNumber *> *unconfirmed, NSString *stop) {
@@ -1440,9 +1671,9 @@ static NSString *VSFillSummary(NSUInteger copied, NSUInteger targets, NSArray<NS
 @property (nonatomic, assign) BOOL pickerConfirmed;
 @property (nonatomic, assign) CFAbsoluteTime pickerClosedAt;
 @property (nonatomic, assign) CFAbsoluteTime pickStartedAt;
-@property (nonatomic, assign) NSInteger pickOutcome;   // 0 chờ, 1 đã chọn, 2 huỷ, 3 popup Pro, 4 phát lại thất bại
+@property (nonatomic, assign) NSInteger pickOutcome;   // 0 chờ, 1 đã chọn, 2 huỷ, 3 popup Pro, 4 nhập ngầm thất bại, 5 editor đóng
 @property (nonatomic, assign) BOOL requirePickerOpen;
-@property (nonatomic, assign) BOOL replaying;          // Dùng lại lựa chọn ảnh đã lưu, không mở bảng chọn
+@property (nonatomic, assign) BOOL replaying;          // Nhập ngầm lựa chọn đã lưu, không mở bảng chọn
 + (void)fillLayers:(NSArray<NSNumber *> *)layers editor:(id)editor runId:(NSUInteger)runId completion:(VSFillCompletion)completion;
 + (void)fillLayers:(NSArray<NSNumber *> *)layers editor:(id)editor runId:(NSUInteger)runId requirePickerOpen:(BOOL)requirePicker completion:(VSFillCompletion)completion;
 @end
@@ -1486,6 +1717,7 @@ static VSLayerFiller *g_activeFiller = nil;
     self.finished = YES;
     g_onLayerAddedHandler = nil;
     g_captureMediaResponse = NO;
+    g_silentMediaReplay = NO;
     g_vsaAutomating = NO;
     g_suppressLayerActionMenu = NO;
     BOOL live = (self.runId == g_runIdentifier);
@@ -1534,11 +1766,12 @@ static VSLayerFiller *g_activeFiller = nil;
     [self selectLayerV4:self.source then:^(BOOL ok) {
         if (![self alive]) { [self finishWithStop:nil]; return; }
         if (!ok) { [self finishWithStop:@"Không chọn được lớp nguồn"]; return; }
-        VSDispatchAfterMS(self.requirePickerOpen ? 250 : 120, ^{ [self openPicker]; });
+        VSDispatchAfterMS(self.requirePickerOpen ? 220 : 100, ^{ [self openPicker]; });
     }];
 }
 
-// Có ảnh đã lưu từ đoạn trước -> phát lại. Chưa có -> mở bảng chọn ảnh như cũ.
+// Đoạn 1 (chưa có ảnh lưu): mở bảng chọn ảnh như cũ.
+// Đoạn 2+ (đã có g_cachedPickResponse): gọi thẳng pickedWithClipPickerResponse:, KHÔNG mở bảng chọn.
 - (void)openPicker {
     if (![self alive]) { [self finishWithStop:nil]; return; }
     id ed = self.editor;
@@ -1562,76 +1795,43 @@ static VSLayerFiller *g_activeFiller = nil;
         s.pickerConfirmed = YES;
     };
 
-    g_captureMediaResponse = !canReplay;
-
-    void (^startPolling)(void) = ^{
-        VSSafePollEditor(self.runId, 120, 1500, [self provider], ^BOOL(id e) {
-            return [self pickConditionOn:e];
-        }, ^(BOOL ok) {
-            [self afterPickWait];
-        });
-    };
-
     if (!canReplay) {
+        g_silentMediaReplay = NO;
+        g_captureMediaResponse = YES;
         BOOL opened = VSTry(^{ [ed pickNewContent]; });
         if (!opened) {
             g_captureMediaResponse = NO;
             [self finishWithStop:@"Không mở được bảng chọn media"];
             return;
         }
-        startPolling();
-        return;
-    }
-
-    // PHÁT LẠI: gọi pickNewContent trước (đúng như đoạn 1, để editor lập ngữ cảnh
-    // "đang chọn media cho lớp nào" và có bảng chọn thật để đóng), đợi bảng chọn hiện,
-    // rồi mới đút lựa chọn đã lưu vào pickedWithClipPickerResponse:.
-    id response = g_cachedPickResponse;
-    BOOL opened = VSTry(^{ [ed pickNewContent]; });
-    if (!opened) {
-        g_cachedPickResponse = nil;
-        g_captureMediaResponse = NO;
-        [self finishWithStop:@"Không mở được bảng chọn media"];
-        return;
-    }
-    startPolling();
-
-    VSSafePollEditor(self.runId, 30, 100, [self provider], ^BOOL(id e) {
-        UIViewController *v = (UIViewController *)e;
-        return v.presentedViewController != nil || v.navigationController.presentedViewController != nil;
-    }, ^(BOOL shown) {
-        if (![self alive] || !shown || !self.replaying) return;   // không hiện -> để timeout 12s xử lý
-        VSDispatchAfterMS(250, ^{
-            if (![self alive] || !self.replaying) return;
-            id e = self.editor;
-            if (!e) return;
-            BOOL fired = VSTry(^{ [e pickedWithClipPickerResponse:response]; });
-            if (!fired) {
-                // Đút lỗi -> bảng chọn đang mở, để người dùng chọn tay và lưu lại
-                g_cachedPickResponse = nil;
-                self.replaying = NO;
-                g_captureMediaResponse = YES;
-            }
+        VSSafePollEditor(self.runId, 120, 1500, [self provider], ^BOOL(id e) {
+            return [self pickConditionOn:e];
+        }, ^(BOOL __unused ok) {
+            [self afterPickWait];
         });
-    });
-}
+        return;
+    }
 
-// Bảng chọn thật đang mở mà phát lại không đóng được -> chờ người dùng chọn tay
-- (void)waitForManualPickOnOpenPicker {
-    g_captureMediaResponse = YES;
-    self.pickOutcome = 0;
-    self.pickerSeenOpen = YES;
-    self.pickerConfirmed = NO;
-    self.pickerClosedAt = 0;
-    __weak VSLayerFiller *wSelf = self;
-    g_onLayerAddedHandler = ^(id sender) {
-        VSLayerFiller *s = wSelf;
-        if (!s || sender != s.editor) return;
-        s.pickerConfirmed = YES;
-    };
-    VSSafePollEditor(self.runId, 120, 1500, [self provider], ^BOOL(id e) {
+    // NHẬP NGẦM TRỰC TIẾP: không gọi pickNewContent, không hiện bảng chọn ảnh.
+    // Hook dismissViewControllerAnimated:completion: sẽ chặn editor tự đóng khi không có picker.
+    id response = g_cachedPickResponse;
+    g_captureMediaResponse = NO;
+    g_silentMediaReplay = YES;
+
+    BOOL fired = VSTry(^{ [ed pickedWithClipPickerResponse:response]; });
+    if (!fired) {
+        g_silentMediaReplay = NO;
+        g_cachedPickResponse = nil;
+        self.replaying = NO;
+        self.requirePickerOpen = NO;
+        [[VSTool shared] updateStatusHUD:@"Nhập ngầm không ăn, mở chọn tay 1 lần…"];
+        VSDispatchAfterMS(80, ^{ [self openPicker]; });
+        return;
+    }
+
+    VSSafePollEditor(self.runId, 60, 200, [self provider], ^BOOL(id e) {
         return [self pickConditionOn:e];
-    }, ^(BOOL ok) {
+    }, ^(BOOL __unused ok) {
         [self afterPickWait];
     });
 }
@@ -1669,24 +1869,22 @@ static VSLayerFiller *g_activeFiller = nil;
 - (void)afterPickWait {
     g_onLayerAddedHandler = nil;
     g_captureMediaResponse = NO;
+    g_silentMediaReplay = NO;
     if (![self alive]) { [self finishWithStop:nil]; return; }
     switch (self.pickOutcome) {
         case 1: [self copyNext]; break;
         case 2: [self finishWithStop:@"Đã huỷ (chưa chọn media)"]; break;
         case 3: [self finishWithStop:@"Popup mua Pro"]; break;
         case 4: {
-            // Phát lại không ăn -> bỏ ảnh đã lưu, chọn tay một lần rồi lưu lại
+            // Nhập ngầm không ăn -> bỏ ảnh đã lưu, mở chọn tay 1 lần rồi lưu lại
             g_cachedPickResponse = nil;
             self.replaying = NO;
             self.requirePickerOpen = NO;
             [[VSTool shared] updateStatusHUD:@"Dùng lại ảnh không được, chọn tay 1 lần…"];
-            UIViewController *vc = (UIViewController *)self.editor;
-            BOOL pickerStillOpen = vc.presentedViewController != nil || vc.navigationController.presentedViewController != nil;
-            if (pickerStillOpen) VSDispatchAfterMS(100, ^{ [self waitForManualPickOnOpenPicker]; });
-            else VSDispatchAfterMS(100, ^{ [self openPicker]; });
+            VSDispatchAfterMS(100, ^{ [self openPicker]; });
             break;
         }
-        case 5: [self finishWithStop:@"Editor tự đóng khi dùng lại ảnh"]; break;
+        case 5: [self finishWithStop:@"Editor bị đóng khi nhập ảnh"]; break;
         default: [self finishWithStop:@"Quá thời gian chọn media"]; break;
     }
 }
@@ -1710,7 +1908,7 @@ static VSLayerFiller *g_activeFiller = nil;
     if (VSPurchasePopupVisible(ed)) { [self finishWithStop:@"Popup mua Pro"]; return; }
 
     if (self.nextIndex >= self.layers.count) {
-        [self selectLayerTurbo:self.source then:^(BOOL ok) {
+        [self selectLayerTurbo:self.source then:^(BOOL __unused ok) {
             id eFinal = self.editor;
             if (eFinal) {
                 VSTry(^{ if ([eFinal respondsToSelector:@selector(refreshDisplay)]) [eFinal refreshDisplay]; });
@@ -1782,6 +1980,8 @@ static VSLayerFiller *g_activeFiller = nil;
 @end
 
 @implementation VSToolRootVC
+- (BOOL)prefersStatusBarHidden { return YES; }
+- (UIStatusBarAnimation)preferredStatusBarUpdateAnimation { return UIStatusBarAnimationNone; }
 @end
 
 // ============================================================================
@@ -1852,7 +2052,7 @@ static void VSLoadPickedImages(NSArray<PHPickerResult *> *results, void (^done)(
         NSItemProvider *provider = results[i].itemProvider;
         if (![provider canLoadObjectOfClass:[UIImage class]]) continue;
         dispatch_group_enter(group);
-        [provider loadObjectOfClass:[UIImage class] completionHandler:^(id obj, NSError *err) {
+        [provider loadObjectOfClass:[UIImage class] completionHandler:^(id obj, NSError *__unused err) {
             @synchronized (images) {
                 images[i] = [obj isKindOfClass:[UIImage class]] ? obj : [NSNull null];
             }
@@ -1863,7 +2063,7 @@ static void VSLoadPickedImages(NSArray<PHPickerResult *> *results, void (^done)(
 }
 
 // ============================================================================
-// NHẬP QR HÀNG LOẠT (đối tượng, không dùng block tự giải phóng chính nó)
+// NHẬP QR HÀNG LOẠT
 // ============================================================================
 
 @interface VSQRBatchImporter : NSObject
@@ -1957,8 +2157,8 @@ static VSQRBatchImporter *g_activeImporter = nil;
 @end
 
 // ============================================================================
-// CHẠY HÀNG LOẠT CÁC PHÂN CẢNH (đối tượng)
-// Đoạn 1: chọn ảnh thật. Các đoạn sau: phát lại đúng ảnh đó.
+// CHẠY HÀNG LOẠT CÁC PHÂN CẢNH
+// Đoạn 1: chọn ảnh thật. Các đoạn sau: tự nhập ngầm không hiện bảng chọn.
 // ============================================================================
 
 @interface VSSceneBatchRunner : NSObject
@@ -1987,7 +2187,6 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
     [self nextScene];
 }
 
-// Luôn kết thúc ở đây: khôi phục scene, dọn dẹp, hiện thông báo
 - (void)finishWithError:(NSString *)err {
     if (self.finished) return;
     self.finished = YES;
@@ -2013,7 +2212,6 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
 - (void)nextScene {
     if (![self alive]) return;
     if (self.offset >= self.total) {
-        // Chờ màn hình Review ổn định rồi mới báo xong
         VSDispatchAfterMS(600, ^{ [self finishWithError:nil]; });
         return;
     }
@@ -2024,7 +2222,7 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
     VSTool *tool = [VSTool shared];
     [tool updateStatusHUD:[NSString stringWithFormat:@"%@ (%lu/%lu): mở…", label, (unsigned long)(o + 1), (unsigned long)self.total]];
 
-    VSWaitForMemory(runId, ^(BOOL memOK) {
+    VSWaitForMemory(runId, ^(BOOL __unused memOK) {
         if (![self alive]) return;
         id rvc = VSFindTopViewControllerNamed(@"VideoReviewEditVC");
         [tool openMultiLayerEditorForScene:sc reviewVC:rvc runId:runId completion:^(id editor) {
@@ -2044,7 +2242,7 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
     [tool importPresetPayload:self.presets[o] codeIdentifier:self.codes[o] intoEditor:editor runId:runId completion:^(NSString *e1) {
         if (![self alive]) return;
         if (e1) { [self finishWithError:[NSString stringWithFormat:@"%@: %@", label, e1]]; return; }
-        VSDispatchAfterMS(500, ^{
+        VSDispatchAfterMS(450, ^{
             if (![self alive]) return;
             id ed = wEd;
             if (!VSEditorIsAlive(ed)) { [self finishWithError:[label stringByAppendingString:@": editor đã bị đóng"]]; return; }
@@ -2053,9 +2251,9 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
             if (layers.count == 0) { [self finishWithError:[label stringByAppendingString:@": preset không có lớp video/ảnh"]]; return; }
 
             BOOL reuse = (g_cachedPickResponse != nil);
-            [tool updateStatusHUD:[label stringByAppendingString:reuse ? @": dùng lại ảnh đã chọn…" : @": chọn ảnh/video để điền các lớp…"]];
+            [tool updateStatusHUD:[label stringByAppendingString:reuse ? @": tự động nhập ảnh đã lưu…" : @": chọn ảnh/video để điền các lớp…"]];
 
-            [VSLayerFiller fillLayers:layers editor:ed runId:runId requirePickerOpen:!reuse completion:^(NSUInteger copied, NSUInteger targets, NSArray<NSNumber *> *unconfirmed, NSString *stop) {
+            [VSLayerFiller fillLayers:layers editor:ed runId:runId requirePickerOpen:!reuse completion:^(NSUInteger __unused copied, NSUInteger __unused targets, NSArray<NSNumber *> *unconfirmed, NSString *stop) {
                 if (![self alive]) return;
                 if (stop) { [self finishWithError:[NSString stringWithFormat:@"%@: %@", label, stop]]; return; }
                 if (unconfirmed.count) {
@@ -2095,9 +2293,11 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
 }
 
 - (void)setupToolInterfaceIfNeeded {
+    VSInstallCoreHooksOnce();
+    VSRefreshStatusBarHiddenEverywhere();
     if (self.window) return;
     static BOOL delayPassed = NO;
-    if (!delayPassed) { delayPassed = YES; VSDispatchAfterMS(2500, ^{ [self setupToolInterfaceIfNeeded]; }); return; }
+    if (!delayPassed) { delayPassed = YES; VSDispatchAfterMS(2000, ^{ [self setupToolInterfaceIfNeeded]; }); return; }
 
     CGRect b = UIScreen.mainScreen.bounds;
     VSToolPassThroughWindow *w = nil;
@@ -2115,20 +2315,94 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
     w.rootViewController = root;
 
     UILabel *hud = [[UILabel alloc] init];
-    hud.backgroundColor = [UIColor colorWithWhite:0 alpha:0.82];
+    hud.backgroundColor = VSToolCardBackgroundColor();
     hud.textColor = UIColor.whiteColor;
-    hud.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    hud.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
     hud.textAlignment = NSTextAlignmentCenter;
     hud.numberOfLines = 2;
-    hud.layer.cornerRadius = 10; hud.clipsToBounds = YES; hud.hidden = YES;
+    hud.layer.cornerRadius = 14;
+    hud.layer.borderWidth = 1.0;
+    hud.layer.borderColor = [VSToolPinkAccent() colorWithAlphaComponent:0.42].CGColor;
+    hud.clipsToBounds = YES;
+    hud.hidden = YES;
     [root.view addSubview:hud];
 
-    self.window = w; self.statusHUDLabel = hud;
+    self.window = w;
+    self.statusHUDLabel = hud;
     self.multiSceneActiveCapturingIndex = -1;
     g_overlayToolWindow = w;
     w.hidden = NO;
-    VSInstallCoreHooksOnce();
-    [self installMenuGestures];
+
+    [self setupFloatingMenuButton];
+    VSRefreshStatusBarHiddenEverywhere();
+}
+
+- (void)setupFloatingMenuButton {
+    UIView *host = self.window.rootViewController.view;
+    if (!host || self.floatingMenuButton) return;
+
+    CGFloat btnSize = 54.0;
+    CGFloat topPad = MAX(host.safeAreaInsets.top, 12.0) + 4.0;
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+    btn.frame = CGRectMake(10.0, topPad, btnSize, btnSize);
+    btn.backgroundColor = UIColor.clearColor;
+    btn.adjustsImageWhenHighlighted = YES;
+    btn.imageView.contentMode = UIViewContentModeScaleAspectFit;
+
+    UIImage *icon = VSFloatingButtonIconImage();
+    if (icon) {
+        [btn setImage:icon forState:UIControlStateNormal];
+    } else {
+        btn.backgroundColor = VSToolPinkAccent();
+        btn.layer.cornerRadius = btnSize / 2.0;
+        [btn setTitle:@"VS" forState:UIControlStateNormal];
+        [btn setTitleColor:VSToolPillTextColor() forState:UIControlStateNormal];
+        btn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    }
+
+    btn.layer.shadowColor = VSToolPinkAccent().CGColor;
+    btn.layer.shadowOpacity = 0.50;
+    btn.layer.shadowRadius = 8.0;
+    btn.layer.shadowOffset = CGSizeMake(0, 2);
+
+    [btn addTarget:self action:@selector(handleFloatingButtonTap:) forControlEvents:UIControlEventTouchUpInside];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handleFloatingButtonPan:)];
+    [btn addGestureRecognizer:pan];
+
+    [host addSubview:btn];
+    self.floatingMenuButton = btn;
+}
+
+- (void)handleFloatingButtonTap:(UIButton *)sender {
+    if (@available(iOS 10.0, *)) {
+        UIImpactFeedbackGenerator *g = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+        [g prepare];
+        [g impactOccurred];
+    }
+    [UIView animateWithDuration:0.10 animations:^{
+        sender.transform = CGAffineTransformMakeScale(0.88, 0.88);
+    } completion:^(BOOL __unused finished) {
+        [UIView animateWithDuration:0.18 delay:0 usingSpringWithDamping:0.6 initialSpringVelocity:0.8
+                            options:UIViewAnimationOptionAllowUserInteraction animations:^{
+            sender.transform = CGAffineTransformIdentity;
+        } completion:nil];
+    }];
+    [self toggleMenu];
+}
+
+- (void)handleFloatingButtonPan:(UIPanGestureRecognizer *)pan {
+    UIView *btn = pan.view;
+    UIView *host = btn.superview;
+    if (!btn || !host) return;
+    CGPoint delta = [pan translationInView:host];
+    CGPoint next = CGPointMake(btn.center.x + delta.x, btn.center.y + delta.y);
+    UIEdgeInsets safe = host.safeAreaInsets;
+    CGFloat hw = btn.bounds.size.width / 2.0;
+    CGFloat hh = btn.bounds.size.height / 2.0;
+    next.x = MAX(hw + 4.0, MIN(host.bounds.size.width - hw - 4.0, next.x));
+    next.y = MAX(MAX(safe.top, 8.0) + hh, MIN(host.bounds.size.height - MAX(safe.bottom, 8.0) - hh, next.y));
+    btn.center = next;
+    [pan setTranslation:CGPointZero inView:host];
 }
 
 - (UIViewController *)topPresenterVC {
@@ -2167,55 +2441,85 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
 - (void)updateStatusHUD:(NSString *)msg {
     UIView *c = self.window.rootViewController.view;
     self.statusHUDLabel.text = msg;
-    CGFloat w = MIN(c.bounds.size.width - 32, 440);
-    self.statusHUDLabel.frame = CGRectMake((c.bounds.size.width - w) / 2.0, c.safeAreaInsets.top + 8, w, 40);
+    CGFloat w = MIN(c.bounds.size.width - 136.0, 320.0);
+    CGFloat topY = MAX(c.safeAreaInsets.top, 10.0) + 8.0;
+    self.statusHUDLabel.frame = CGRectMake((c.bounds.size.width - w) / 2.0, topY, w, 40.0);
     self.statusHUDLabel.hidden = (msg.length == 0);
 }
 
-- (void)showNotificationAlert:(NSString *)msg title:(NSString *)title {
+- (void)showStyledAlertWithTitle:(NSString *)title message:(NSString *)msg {
     [self updateStatusHUD:nil];
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:title ?: @"VideoStarTool" message:msg preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentFromTop:a];
+    UIView *host = self.window.rootViewController.view;
+    if (!host) return;
+    if (self.activeAlertView) {
+        [self.activeAlertView removeFromSuperview];
+        self.activeAlertView = nil;
+    }
+    NSString *icon = VSContains(title ?: @"", @"Thành công") ? @"✓" : @"!";
+    VSToolAlertView *alert = [[VSToolAlertView alloc] initWithFrame:host.bounds
+                                                              title:title ?: @"VideoStarTool"
+                                                            message:msg
+                                                           iconText:icon
+                                                        buttonTitle:@"XONG"];
+    [host addSubview:alert];
+    if (self.floatingMenuButton) [host bringSubviewToFront:self.floatingMenuButton];
+    self.activeAlertView = alert;
+    [alert showAnimated];
+}
+
+- (void)showNotificationAlert:(NSString *)msg title:(NSString *)title {
+    [self showStyledAlertWithTitle:title message:msg];
 }
 
 - (void)dismissBottomActionBar { [self.bottomActionBar removeFromSuperview]; self.bottomActionBar = nil; }
 
-// Thẻ cơ bản: nền xám đậm, viền mảnh, chữ trắng hệ thống
+// Thẻ tím đậm bo tròn + viền hồng pastel
 - (UIView *)buildCardContainerWithFrame:(CGRect)f title:(NSString *)title subtitle:(NSString *)subtitle {
     UIView *card = [[UIView alloc] initWithFrame:f];
-    card.backgroundColor = VSToolCardBackgroundColor();
-    card.layer.cornerRadius = 12;
-    card.layer.borderWidth = 0.5;
-    card.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.25].CGColor;
+    card.backgroundColor = UIColor.clearColor;
+    card.layer.cornerRadius = 22.0;
+    card.layer.borderWidth = 1.0;
+    card.layer.borderColor = [VSToolPinkAccent() colorWithAlphaComponent:0.28].CGColor;
+    card.layer.shadowColor = UIColor.blackColor.CGColor;
+    card.layer.shadowOpacity = 0.60;
+    card.layer.shadowRadius = 20.0;
+    card.layer.shadowOffset = CGSizeMake(0, 10);
     card.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
-    UILabel *h = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, f.size.width - 32, 22)];
-    h.text = title; h.textColor = UIColor.whiteColor; h.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    [card.layer insertSublayer:VSMakePlumGradient(CGRectMake(0, 0, f.size.width, f.size.height), 22.0) atIndex:0];
+
+    UILabel *h = [[UILabel alloc] initWithFrame:CGRectMake(18, 14, f.size.width - 36, 22)];
+    h.text = title;
+    h.textColor = UIColor.whiteColor;
+    h.font = [UIFont systemFontOfSize:17 weight:UIFontWeightBold];
     h.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    UILabel *s = [[UILabel alloc] initWithFrame:CGRectMake(16, 38, f.size.width - 32, 40)];
-    s.text = subtitle; s.numberOfLines = 0; s.textColor = [UIColor colorWithWhite:0.75 alpha:1.0]; s.font = [UIFont systemFontOfSize:13];
+
+    UILabel *s = [[UILabel alloc] initWithFrame:CGRectMake(18, 38, f.size.width - 36, 38)];
+    s.text = subtitle;
+    s.numberOfLines = 0;
+    s.textColor = VSToolSubtitleColor();
+    s.font = [UIFont systemFontOfSize:13];
     s.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    [card addSubview:h]; [card addSubview:s];
+
+    [card addSubview:h];
+    [card addSubview:s];
     return card;
 }
 
 - (void)displayBottomActionBarWithTitle:(NSString *)title message:(NSString *)msg confirmTitle:(NSString *)confirmTitle onConfirm:(void (^)(void))onConfirm onCancel:(void (^)(void))onCancel {
     [self dismissBottomActionBar];
     UIView *c = self.window.rootViewController.view;
-    CGFloat w = MIN(c.bounds.size.width - 24, 460), h = 132;
-    UIView *bar = [self buildCardContainerWithFrame:CGRectMake((c.bounds.size.width - w) / 2.0, c.bounds.size.height - c.safeAreaInsets.bottom - h - 70, w, h) title:title subtitle:msg];
+    CGFloat w = MIN(c.bounds.size.width - 28.0, 440.0), h = 142.0;
+    UIView *bar = [self buildCardContainerWithFrame:CGRectMake((c.bounds.size.width - w) / 2.0, c.bounds.size.height - c.safeAreaInsets.bottom - h - 68.0, w, h) title:title subtitle:msg];
     self.bottomBarConfirmBlock = onConfirm; self.bottomBarCancelBlock = onCancel;
-    CGFloat bw = (w - 32 - 12) / 2.0;
-    UIButton *cb = VSToolCreateOutlineButton(@"Hủy", CGRectMake(16, h - 50, bw, 38));
-    cb.layer.borderColor = [UIColor colorWithWhite:0.5 alpha:1.0].CGColor;
-    [cb setTitleColor:[UIColor colorWithWhite:0.8 alpha:1.0] forState:UIControlStateNormal];
-    UIButton *ok = VSToolCreateOutlineButton(confirmTitle, CGRectMake(16 + bw + 12, h - 50, bw, 38));
-    ok.backgroundColor = VSBasicBlue();
-    [ok setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    CGFloat bw = (w - 36.0 - 12.0) / 2.0;
+    UIButton *cb = VSToolCreatePillButton(@"Hủy", CGRectMake(18, h - 54, bw, 40), NO);
+    UIButton *ok = VSToolCreatePillButton(confirmTitle, CGRectMake(18 + bw + 12, h - 54, bw, 40), YES);
     [cb addTarget:self action:@selector(handleBottomBarCancel) forControlEvents:UIControlEventTouchUpInside];
     [ok addTarget:self action:@selector(handleBottomBarConfirm) forControlEvents:UIControlEventTouchUpInside];
-    [bar addSubview:cb]; [bar addSubview:ok];
-    [c addSubview:bar]; self.bottomActionBar = bar;
+    [bar addSubview:cb];
+    [bar addSubview:ok];
+    [c addSubview:bar];
+    self.bottomActionBar = bar;
 }
 
 - (void)handleBottomBarConfirm {
@@ -2232,41 +2536,6 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
     if (cb) cb();
 }
 
-- (void)installMenuGestures {
-    [self attachMenuGestureToView:self.window.rootViewController.view];
-    for (UIWindow *w in VSAllWindows()) [self attachMenuGestureToView:w];
-    [NSNotificationCenter.defaultCenter addObserverForName:UIWindowDidBecomeVisibleNotification
-                                                    object:nil
-                                                     queue:NSOperationQueue.mainQueue
-                                                usingBlock:^(NSNotification *note) {
-        [self attachMenuGestureToView:note.object];
-    }];
-    [self showMenuHintOnce];
-}
-
-- (void)attachMenuGestureToView:(id)object {
-    if (![object isKindOfClass:[UIView class]]) return;
-    UIView *view = (UIView *)object;
-    if (view == g_overlayToolWindow || view.hidden) return;
-    NSString *cn = NSStringFromClass([view class]);
-    if ([cn containsString:@"Keyboard"] || [cn containsString:@"TextEffects"]) return;
-    for (UIGestureRecognizer *g in view.gestureRecognizers) {
-        if ([g.name isEqualToString:kVSMenuGestureName]) return;
-    }
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleMenuGesture:)];
-    tap.numberOfTouchesRequired = 3;
-    tap.numberOfTapsRequired = 2;
-    tap.cancelsTouchesInView = NO;
-    tap.delaysTouchesBegan = NO;
-    tap.delaysTouchesEnded = NO;
-    tap.name = kVSMenuGestureName;
-    [view addGestureRecognizer:tap];
-}
-
-- (void)handleMenuGesture:(UIGestureRecognizer *)g {
-    if (g.state == UIGestureRecognizerStateRecognized) [self toggleMenu];
-}
-
 - (void)toggleMenu {
     if (self.menuView) { [self hideMenuWithCompletion:nil]; return; }
     [self showMenu];
@@ -2277,6 +2546,7 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
     if (!host || self.menuView) return;
     VSToolMenuView *menu = [[VSToolMenuView alloc] initWithFrame:host.bounds];
     [host addSubview:menu];
+    if (self.floatingMenuButton) [host bringSubviewToFront:self.floatingMenuButton];
     self.menuView = menu;
     [menu showAnimated];
 }
@@ -2304,18 +2574,7 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
 
 - (void)stopCurrentTaskFromMenu {
     [self terminateCurrentTaskQuietly];
-    [self showNotificationAlert:@"Đã dừng" title:@"Đã Dừng"];
-}
-
-- (void)showMenuHintOnce {
-    static BOOL shown = NO;
-    if (shown) return;
-    shown = YES;
-    NSString *hint = @"Chạm 3 ngón 2 lần để mở menu";
-    [self updateStatusHUD:hint];
-    VSDispatchAfterMS(3500, ^{
-        if (!self.currentTaskName && [self.statusHUDLabel.text isEqualToString:hint]) [self updateStatusHUD:nil];
-    });
+    [self showNotificationAlert:@"Đã dừng tác vụ hiện tại." title:@"Đã Dừng"];
 }
 
 - (NSUInteger)startNewTaskWithDescription:(NSString *)name initialStatus:(NSString *)status {
@@ -2326,6 +2585,7 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
     g_createInProgress = NO;
     g_vsaAutomating = NO;
     g_captureMediaResponse = NO;
+    g_silentMediaReplay = NO;
     g_cachedPickResponse = nil;
     g_onLayerAddedHandler = nil;
     self.currentTaskName = name;
@@ -2349,6 +2609,7 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
     g_createInProgress = NO;
     g_vsaAutomating = NO;
     g_captureMediaResponse = NO;
+    g_silentMediaReplay = NO;
     g_cachedPickResponse = nil;
     g_onLayerAddedHandler = nil;
     g_activeFiller = nil;
@@ -2370,10 +2631,7 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
 }
 
 - (void)showRunResultAlert:(NSString *)msg title:(NSString *)title {
-    [self updateStatusHUD:nil];
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:title ?: @"VideoStarTool" message:msg preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
-    [self presentFromTop:a];
+    [self showStyledAlertWithTitle:title message:msg];
 }
 
 // ============================================================================
@@ -2382,7 +2640,7 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
 
 - (void)executeFeature1ReplaceLayers {
     id editor = VSFindTopViewControllerNamed(@"MultiLayerWizEffectVC");
-    if (!editor) { [self showNotificationAlert:@"Vào màn hình Nhiều lớp trước." title:@"Chưa ở Nhiều lớp"]; return; }
+    if (!editor) { [self showNotificationAlert:@"Hãy mở một Scene Multi-Layer rồi bấm lại." title:@"Chưa mở Multi-Layer"]; return; }
 
     NSArray<NSNumber *> *layers = VSDetectFillableLayers(VSEngineFrom(editor), NO);
     if (layers.count == 0) { [self showNotificationAlert:@"Không có lớp video/ảnh nào để thay." title:@"Không có lớp"]; return; }
@@ -2401,8 +2659,8 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
 
 - (void)executeFeature2DisplayLastCode {
     UIImage *img = VSReadLastPersistedQRCodeImage();
-    if (!img) { [self showNotificationAlert:@"Chưa có QR nào" title:@"Chưa có"]; return; }
-    if (!VSDecodeQRCodeMessageFromImage(img)) { [self showNotificationAlert:@"QR không hợp lệ" title:@"Lỗi"]; return; }
+    if (!img) { [self showNotificationAlert:@"Chưa có QR nào được lưu." title:@"Chưa có"]; return; }
+    if (!VSDecodeQRCodeMessageFromImage(img)) { [self showNotificationAlert:@"QR không hợp lệ." title:@"Lỗi"]; return; }
     VSToolQRCodePreviewVC *vc = [VSToolQRCodePreviewVC new];
     vc.qrImage = img;
     vc.modalPresentationStyle = UIModalPresentationFullScreen;
@@ -2415,7 +2673,7 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
 
 - (void)executeFeature3AutoSplitBeat {
     id reviewVC = VSFindTopViewControllerNamed(@"VideoReviewEditVC");
-    if (!reviewVC) { [self showNotificationAlert:@"Vào màn hình Review trước." title:@"Sai vị trí"]; return; }
+    if (!reviewVC) { [self showNotificationAlert:@"Hãy vào màn hình Review trước rồi bấm lại." title:@"Sai vị trí"]; return; }
     NSUInteger runId = [self startNewTaskWithDescription:@"Auto chia beat" initialStatus:@"Chuẩn bị…"];
 
     __weak id wRvc = reviewVC;
@@ -2526,12 +2784,12 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
 }
 
 // ============================================================================
-// CHỨC NĂNG 4: Chọn phân cảnh -> Bắt đầu -> vào kho ảnh chọn QR -> tự chạy
+// CHỨC NĂNG 4: Chọn phân cảnh -> Bắt đầu -> chọn ảnh QR -> tự chạy ngầm
 // ============================================================================
 
 - (void)executeFeature4BatchMultiScene {
     id reviewVC = VSFindTopViewControllerNamed(@"VideoReviewEditVC");
-    if (!reviewVC) { [self showNotificationAlert:@"Vào màn hình phân cảnh trước" title:@"Sai vị trí"]; return; }
+    if (!reviewVC) { [self showNotificationAlert:@"Hãy vào màn hình phân cảnh trước rồi bấm lại." title:@"Sai vị trí"]; return; }
     NSUInteger runId = [self startNewTaskWithDescription:@"Auto code + ảnh" initialStatus:nil];
 
     __block NSUInteger origScene = 0;
@@ -2579,7 +2837,6 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
         [self.multiScenePresets addObject:[NSNull null]];
         [self.multiSceneCodes addObject:[NSNull null]];
     }
-    // Chờ panel Hợp nhất đóng hẳn rồi mở thẳng kho ảnh
     VSDispatchAfterMS(350, ^{ [self presentQRPicker]; });
 }
 
@@ -2639,7 +2896,6 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
 
 - (void)handleMultiSceneCancel { [self terminateCurrentTaskQuietly]; }
 
-// Nhận đủ code -> chạy luôn. Đoạn 1 chọn ảnh, các đoạn sau dùng lại ảnh đó.
 - (void)beginBatchProcessing {
     NSUInteger runId = self.multiSceneRunId;
     if (runId != g_runIdentifier) return;
@@ -2660,13 +2916,11 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
 - (void)showProcessingProgressPanel {
     [self.multiSceneCardView removeFromSuperview];
     UIView *c = self.window.rootViewController.view;
-    CGFloat w = MIN(c.bounds.size.width - 24, 460), h = 132;
-    UIView *card = [self buildCardContainerWithFrame:CGRectMake((c.bounds.size.width - w) / 2.0, c.bounds.size.height - c.safeAreaInsets.bottom - h - 70, w, h)
+    CGFloat w = MIN(c.bounds.size.width - 28.0, 440.0), h = 142.0;
+    UIView *card = [self buildCardContainerWithFrame:CGRectMake((c.bounds.size.width - w) / 2.0, c.bounds.size.height - c.safeAreaInsets.bottom - h - 68.0, w, h)
                                                title:@"Đang chạy"
-                                            subtitle:@"Chọn ảnh/video ở đoạn đầu. Các đoạn sau tự dùng lại ảnh đó."];
-    UIButton *b = VSToolCreateOutlineButton(@"Dừng", CGRectMake(w - 16 - 110, h - 50, 110, 38));
-    b.layer.borderColor = [UIColor colorWithRed:1.0 green:0.35 blue:0.32 alpha:1.0].CGColor;
-    [b setTitleColor:[UIColor colorWithRed:1.0 green:0.35 blue:0.32 alpha:1.0] forState:UIControlStateNormal];
+                                            subtitle:@"Chọn ảnh/video 1 lần ở đoạn đầu. Các đoạn sau tự nhập ngầm, không mở lại bảng chọn."];
+    UIButton *b = VSToolCreatePillButton(@"Dừng", CGRectMake(w - 18 - 116, h - 54, 116, 40), YES);
     [b addTarget:self action:@selector(handleMultiSceneCancel) forControlEvents:UIControlEventTouchUpInside];
     [card addSubview:b];
     [c addSubview:card];
@@ -2795,8 +3049,10 @@ static void VSAbortActiveTask(NSString *reason) {
 }
 
 static void VSBootstrapAutomation(void) {
-    if (!NSClassFromString(@"MultiLayerWizEffectVC")) return;
     VSRunOnMain(^{
+        VSInstallCoreHooksOnce();
+        VSRefreshStatusBarHiddenEverywhere();
+        if (!NSClassFromString(@"MultiLayerWizEffectVC")) return;
         VSTry(^{ [VSTool.shared setupToolInterfaceIfNeeded]; });
     });
 }
@@ -2807,7 +3063,7 @@ __attribute__((constructor)) static void VSToolInitializerEntry(void) {
             [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
                                                              object:nil
                                                               queue:NSOperationQueue.mainQueue
-                                                         usingBlock:^(NSNotification *note) {
+                                                         usingBlock:^(NSNotification *__unused note) {
                 @autoreleasepool { VSBootstrapAutomation(); }
             }];
             if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) {
