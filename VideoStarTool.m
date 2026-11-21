@@ -1389,7 +1389,7 @@ static UIView *VSMakeDivider(CGRect frame) {
 - (void)hideAnimatedWithCompletion:(void (^)(void))completion;
 - (void)buildPanel;
 - (UIButton *)pillWithTitle:(NSString *)title frame:(CGRect)frame;
-- (VSToolMenuRowControl *)rowWithIndex:(NSInteger)index title:(NSString *)title subtitle:(NSString *)subtitle frame:(CGRect)frame;
+- (VSToolMenuRowControl *)rowWithIndex:(NSInteger)index title:(NSString *)title frame:(CGRect)frame;
 - (void)haptic;
 - (BOOL)isSingleTouchInArea:(UIView *)area forEvent:(UIEvent *)event;
 - (void)menuControlTapped:(UIControl *)sender forEvent:(UIEvent *)event;
@@ -1460,53 +1460,45 @@ static UIView *VSMakeDivider(CGRect frame) {
     UILabel *title = VSMenuMakeLabel(CGRectMake(inner, y, cw, 28), @"VideoStarTool",
                                      [UIFont systemFontOfSize:21 weight:UIFontWeightBold], UIColor.whiteColor, NSTextAlignmentCenter);
     [_panel addSubview:title];
-    y += 30.0;
-
-    UILabel *sub = VSMenuMakeLabel(CGRectMake(inner, y, cw, 16), @"Chạm biểu tượng nổi để mở hoặc đóng menu",
-                                   [UIFont systemFontOfSize:12], VSToolSubtitleColor(), NSTextAlignmentCenter);
-    [_panel addSubview:sub];
-    y += 22.0;
+    y += 36.0;
 
     [_panel addSubview:VSMakeDivider(CGRectMake(inner, y, cw, 1))];
     y += 14.0;
 
-    CGFloat cardH = 54.0;
-    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(inner, y, cw, cardH)];
-    card.backgroundColor = [VSToolPinkAccent() colorWithAlphaComponent:0.08];
-    card.layer.cornerRadius = 16.0;
-    card.layer.borderWidth = 1.0;
-    card.layer.borderColor = [VSToolPinkAccent() colorWithAlphaComponent:0.22].CGColor;
-    [_panel addSubview:card];
-
-    UIFont *capFont = [UIFont systemFontOfSize:10.5 weight:UIFontWeightBold];
-    UILabel *cap = VSMenuMakeLabel(CGRectMake(16, 9, cw - 116, 14), nil, capFont, VSToolPinkAccent(), NSTextAlignmentLeft);
     if (running) {
+        CGFloat cardH = 52.0;
+        UIView *card = [[UIView alloc] initWithFrame:CGRectMake(inner, y, cw, cardH)];
+        card.backgroundColor = [VSToolPinkAccent() colorWithAlphaComponent:0.08];
+        card.layer.cornerRadius = 16.0;
+        card.layer.borderWidth = 1.0;
+        card.layer.borderColor = [VSToolPinkAccent() colorWithAlphaComponent:0.22].CGColor;
+        [_panel addSubview:card];
+
+        UIFont *capFont = [UIFont systemFontOfSize:10.5 weight:UIFontWeightBold];
+        UILabel *cap = VSMenuMakeLabel(CGRectMake(16, 8, cw - 116, 14), nil, capFont, VSToolPinkAccent(), NSTextAlignmentLeft);
         cap.attributedText = VSLetterSpaced(@"ĐANG CHẠY", 1.8, VSToolPinkAccent(), capFont);
-        UILabel *name = VSMenuMakeLabel(CGRectMake(16, 26, cw - 116, 20), tool.currentTaskName,
+        [card addSubview:cap];
+
+        UILabel *name = VSMenuMakeLabel(CGRectMake(16, 25, cw - 116, 20), tool.currentTaskName,
                                         [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold], UIColor.whiteColor, NSTextAlignmentLeft);
         [card addSubview:name];
+
         UIButton *stop = [self pillWithTitle:@"Dừng" frame:CGRectMake(cw - 14 - 76, (cardH - 32) / 2.0, 76, 32)];
         stop.tag = kVSMenuTagStop;
         [stop addTarget:self action:@selector(menuControlTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
         [card addSubview:stop];
-    } else {
-        cap.attributedText = VSLetterSpaced(@"SẴN SÀNG", 1.8, VSToolPinkAccent(), capFont);
-        UILabel *hint = VSMenuMakeLabel(CGRectMake(16, 26, cw - 32, 20), @"Chọn một chức năng bên dưới",
-                                        [UIFont systemFontOfSize:13], VSToolSubtitleColor(), NSTextAlignmentLeft);
-        [card addSubview:hint];
+        y += cardH + 12.0;
     }
-    [card addSubview:cap];
-    y += cardH + 12.0;
 
-    NSArray<NSArray<NSString *> *> *items = @[
-        @[@"Auto nhập ảnh vào các lớp (x10)", @"Chọn 1 ảnh/video, copy siêu nhanh sang các lớp còn lại"],
-        @[@"Hiển thị code gần nhất", @"Xem lại mã QR vừa nhập"],
-        @[@"Auto chia beat", @"Tự chia phân cảnh theo nhịp"],
-        @[@"Auto nhập code + ảnh vào phân cảnh", @"Chọn ảnh 1 lần ở đoạn 1, đoạn sau tự nhập ngầm"]
+    NSArray<NSString *> *items = @[
+        @"Auto nhập ảnh vào các lớp (x10)",
+        @"Hiển thị code gần nhất",
+        @"Auto chia beat",
+        @"Auto nhập code + ảnh vào phân cảnh"
     ];
-    CGFloat rowH = 54.0, gap = 8.0;
+    CGFloat rowH = 48.0, gap = 9.0;
     for (NSUInteger i = 0; i < items.count; i++) {
-        VSToolMenuRowControl *row = [self rowWithIndex:(NSInteger)(i + 1) title:items[i][0] subtitle:items[i][1]
+        VSToolMenuRowControl *row = [self rowWithIndex:(NSInteger)(i + 1) title:items[i]
                                                  frame:CGRectMake(inner, y, cw, rowH)];
         [row addTarget:self action:@selector(menuControlTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
         [_panel addSubview:row];
@@ -1543,16 +1535,16 @@ static UIView *VSMakeDivider(CGRect frame) {
     return b;
 }
 
-- (VSToolMenuRowControl *)rowWithIndex:(NSInteger)index title:(NSString *)title subtitle:(NSString *)subtitle frame:(CGRect)frame {
+- (VSToolMenuRowControl *)rowWithIndex:(NSInteger)index title:(NSString *)title frame:(CGRect)frame {
     VSToolMenuRowControl *row = [[VSToolMenuRowControl alloc] initWithFrame:frame];
     row.tag = index;
     row.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.06];
-    row.layer.cornerRadius = 16.0;
+    row.layer.cornerRadius = 15.0;
     row.layer.borderWidth = 1.0;
     row.layer.borderColor = [VSToolPinkAccent() colorWithAlphaComponent:0.16].CGColor;
     row.autoresizingMask = UIViewAutoresizingFlexibleWidth;
 
-    CGFloat d = 34.0;
+    CGFloat d = 32.0;
     UIView *badge = [[UIView alloc] initWithFrame:CGRectMake(12, (frame.size.height - d) / 2.0, d, d)];
     badge.userInteractionEnabled = NO;
     badge.backgroundColor = VSToolPinkAccent();
@@ -1562,21 +1554,19 @@ static UIView *VSMakeDivider(CGRect frame) {
     badge.layer.shadowRadius = 7.0;
     badge.layer.shadowOffset = CGSizeZero;
     UILabel *num = VSMenuMakeLabel(CGRectMake(0, 0, d, d), [NSString stringWithFormat:@"%ld", (long)index],
-                                   [UIFont systemFontOfSize:15 weight:UIFontWeightBold], VSToolPillTextColor(),
+                                   [UIFont systemFontOfSize:14.5 weight:UIFontWeightBold], VSToolPillTextColor(),
                                    NSTextAlignmentCenter);
     [badge addSubview:num];
     [row addSubview:badge];
 
     CGFloat tx = 12.0 + d + 12.0;
-    CGFloat tw = frame.size.width - tx - 34.0;
-    UILabel *t = VSMenuMakeLabel(CGRectMake(tx, 9, tw, 20), title,
+    CGFloat tw = frame.size.width - tx - 30.0;
+    UILabel *t = VSMenuMakeLabel(CGRectMake(tx, (frame.size.height - 22.0) / 2.0, tw, 22.0), title,
                                  [UIFont systemFontOfSize:14.5 weight:UIFontWeightSemibold], UIColor.whiteColor, NSTextAlignmentLeft);
-    UILabel *s = VSMenuMakeLabel(CGRectMake(tx, 30, tw, 16), subtitle,
-                                 [UIFont systemFontOfSize:11.5], VSToolSubtitleColor(), NSTextAlignmentLeft);
+    t.minimumScaleFactor = 0.72;
     [row addSubview:t];
-    [row addSubview:s];
 
-    UILabel *chev = VSMenuMakeLabel(CGRectMake(frame.size.width - 30, (frame.size.height - 26) / 2.0, 18, 26), @"›",
+    UILabel *chev = VSMenuMakeLabel(CGRectMake(frame.size.width - 28, (frame.size.height - 26) / 2.0, 18, 26), @"›",
                                     [UIFont systemFontOfSize:22 weight:UIFontWeightMedium], VSToolPinkAccent(), NSTextAlignmentCenter);
     chev.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
     [row addSubview:chev];
@@ -2916,13 +2906,31 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
 - (void)showProcessingProgressPanel {
     [self.multiSceneCardView removeFromSuperview];
     UIView *c = self.window.rootViewController.view;
-    CGFloat w = MIN(c.bounds.size.width - 28.0, 440.0), h = 142.0;
-    UIView *card = [self buildCardContainerWithFrame:CGRectMake((c.bounds.size.width - w) / 2.0, c.bounds.size.height - c.safeAreaInsets.bottom - h - 68.0, w, h)
-                                               title:@"Đang chạy"
-                                            subtitle:@"Chọn ảnh/video 1 lần ở đoạn đầu. Các đoạn sau tự nhập ngầm, không mở lại bảng chọn."];
-    UIButton *b = VSToolCreatePillButton(@"Dừng", CGRectMake(w - 18 - 116, h - 54, 116, 40), YES);
+    CGFloat w = MIN(c.bounds.size.width - 28.0, 440.0), h = 68.0;
+    UIView *card = [[UIView alloc] initWithFrame:CGRectMake((c.bounds.size.width - w) / 2.0, c.bounds.size.height - c.safeAreaInsets.bottom - h - 68.0, w, h)];
+    card.backgroundColor = UIColor.clearColor;
+    card.layer.cornerRadius = 22.0;
+    card.layer.borderWidth = 1.0;
+    card.layer.borderColor = [VSToolPinkAccent() colorWithAlphaComponent:0.28].CGColor;
+    card.layer.shadowColor = UIColor.blackColor.CGColor;
+    card.layer.shadowOpacity = 0.60;
+    card.layer.shadowRadius = 20.0;
+    card.layer.shadowOffset = CGSizeMake(0, 10);
+    card.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
+    [card.layer insertSublayer:VSMakePlumGradient(CGRectMake(0, 0, w, h), 22.0) atIndex:0];
+
+    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(20.0, (h - 24.0) / 2.0, w - 156.0, 24.0)];
+    lbl.text = @"Đang chạy";
+    lbl.textColor = UIColor.whiteColor;
+    lbl.font = [UIFont systemFontOfSize:17 weight:UIFontWeightBold];
+    lbl.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [card addSubview:lbl];
+
+    UIButton *b = VSToolCreatePillButton(@"Dừng", CGRectMake(w - 16.0 - 110.0, (h - 40.0) / 2.0, 110.0, 40.0), YES);
+    b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
     [b addTarget:self action:@selector(handleMultiSceneCancel) forControlEvents:UIControlEventTouchUpInside];
     [card addSubview:b];
+
     [c addSubview:card];
     self.multiSceneCardView = card;
 }
