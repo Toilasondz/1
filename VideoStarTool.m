@@ -1,5 +1,20 @@
 // ============================================================================
-// VideoStarTool.m — Video Star 14.3.3 (build 1809) — v5.5
+// VideoStarTool.m — Video Star 14.3.3 & 15.3.3 — v5.7
+//
+// CẬP NHẬT v5.7 (Tối ưu tốc độ Chức năng 4 — siêu tốc):
+//   - Cắt giảm tối đa các khoảng chờ chết giữa các bước (nạp preset, điền lớp,
+//     chờ ổn định trước khi Tạo, chuyển cảnh) — tiết kiệm ~2 giây/đoạn.
+//   - Ưu tiên sao chép lớp trực tiếp ở tầng MultiLayerEngine
+//     (copyContentFromLayerNum:toLayerNum:forScene:) không qua UI, lỗi thì tự
+//     fallback về copyLayer:.
+//   - Giảm độ trễ đọc QR hàng loạt từ 300ms xuống 60ms/ảnh.
+//
+// CẬP NHẬT v5.6 (hỗ trợ Video Star 15.3.3):
+//   - Hook đủ cả 4 biến thể confirmAddingLayer:... (thêm bản removeOverlayBlending:
+//     và 6 tham số mới trên 15.3.3) để xác nhận chọn/nhập ảnh chính xác.
+//   - Tự bỏ qua màn hình xem trước khi chia beat (shouldShowSplitPreview) trên 15.3.3.
+//   - Hỗ trợ đọc nút từ CustomPopupVerticalButtonsView mới trên 15.3.3.
+//   - Bổ sung nhận diện thay đổi chữ ký lớp (layerImage) để tăng độ ổn định.
 //
 // CẬP NHẬT v5.5:
 //   - Giao diện mới nền tím đậm + hồng pastel phát sáng (#FF9FCA), nút bo tròn
@@ -156,6 +171,7 @@ static BOOL VSMemoryHealthy(void) {
 - (BOOL)overlayObjectExistsOnLayerNum:(NSUInteger)n;
 - (BOOL)zapsObjectExistsOnLayerNum:(NSUInteger)n;
 - (void)copyLayer:(NSUInteger)n;
+- (void)copyContentFromLayerNum:(NSUInteger)src toLayerNum:(NSUInteger)dst forScene:(NSUInteger)scene;
 - (void)overwrite:(id)object isAbleToShowTheLayerActionMenu:(BOOL)show;
 - (void)overwrite:(id)object isAbleToShowTheLayerActionMenu:(BOOL)show removeOverlayBlending:(BOOL)remove;
 @end
@@ -180,6 +196,10 @@ static UIWindow *g_overlayToolWindow = nil;
 static void (^g_onLayerAddedHandler)(id sender) = nil;
 static IMP g_origConfirmAdd4 = NULL;
 static IMP g_origConfirmAdd5 = NULL;
+static IMP g_origConfirmAdd5Blend = NULL;
+static IMP g_origConfirmAdd6 = NULL;
+static IMP g_origShouldShowSplitPreview = NULL;
+static BOOL g_suppressSplitPreview = NO;
 
 static NSString *VSCheapDescription(id obj) {
     if (!obj || obj == [NSNull null]) return @"";
@@ -500,6 +520,21 @@ static NSArray<NSString *> *VSPopupButtonTitles(id popup, NSDictionary<NSString 
             if (![titles containsObject:t]) [titles addObject:t];
         }
     }
+    if (map.count == 0 && [popup isKindOfClass:[UIView class]]) {
+        NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:(UIView *)popup];
+        while (queue.count > 0) {
+            UIView *v = queue.firstObject;
+            [queue removeObjectAtIndex:0];
+            if ([v isKindOfClass:[UIButton class]]) {
+                NSString *t = ((UIButton *)v).currentTitle;
+                if (t.length) {
+                    if (!map[t]) map[t] = (UIButton *)v;
+                    if (![titles containsObject:t]) [titles addObject:t];
+                }
+            }
+            if (v.subviews.count) [queue addObjectsFromArray:v.subviews];
+        }
+    }
     if (buttonMap) *buttonMap = map;
     return titles;
 }
@@ -695,8 +730,10 @@ static NSString *VSLayerSignature(id engine, NSUInteger n) {
         if ([asset isKindOfClass:[AVURLAsset class]]) assetKey = ((AVURLAsset *)asset).URL.absoluteString ?: @"";
         id tex = VSSafeValueForKey(generator, @"layerImageTextureID");
         NSString *texKey = [tex isKindOfClass:[NSNumber class]] ? [tex description] : @"";
+        id imgObj = VSSafeValueForKey(generator, @"layerImage");
+        NSString *imgKey = imgObj ? [NSString stringWithFormat:@"%p", imgObj] : @"";
         NSString *infoKey = VSCheapDescription(VSSafeValueForKey(layer, @"origAssetInfo"));
-        sig = [NSString stringWithFormat:@"%@|%@|%@", assetKey, texKey, infoKey];
+        sig = [NSString stringWithFormat:@"%@|%@|%@|%@", assetKey, texKey, imgKey, infoKey];
     });
     return sig;
 }
@@ -735,6 +772,20 @@ static BOOL VSFireCopyLayer(id editor, id engine, NSUInteger src) {
     if (!receiver) return NO;
     @try {
         ((void (*)(id, SEL, NSUInteger))objc_msgSend)(receiver, s, src);
+        return YES;
+    } @catch (NSException *__unused e) { return NO; }
+}
+
+static BOOL VSFireEngineCopyLayer(id editor, id engine, NSUInteger src, NSUInteger dst) {
+    SEL s = @selector(copyContentFromLayerNum:toLayerNum:forScene:);
+    if (!engine || ![engine respondsToSelector:s]) return NO;
+    __block NSUInteger scene = 0;
+    VSTry(^{
+        id nav = [editor navigationController];
+        if ([nav respondsToSelector:@selector(navSceneIndex)]) scene = [nav navSceneIndex];
+    });
+    @try {
+        ((void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger))objc_msgSend)(engine, s, src, dst, scene);
         return YES;
     } @catch (NSException *__unused e) { return NO; }
 }
@@ -969,6 +1020,25 @@ static void VSInstallCoreHooksOnce(void) {
                 ((void (*)(id, SEL, SEL, id, id, id))g_origConfirmAdd4)(selfInstance, @selector(confirmAddingLayer:object:object2:object3:), makeSel, o1, o2, o3);
             VSNotifyLayerAdded(selfInstance);
         }, &g_origConfirmAdd4);
+
+        VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", NSSelectorFromString(@"confirmAddingLayer:object:object2:object3:removeOverlayBlending:"), ^(id selfInstance, SEL makeSel, id o1, id o2, id o3, BOOL removeBlend) {
+            if (g_origConfirmAdd5Blend)
+                ((void (*)(id, SEL, SEL, id, id, id, BOOL))g_origConfirmAdd5Blend)(selfInstance, NSSelectorFromString(@"confirmAddingLayer:object:object2:object3:removeOverlayBlending:"), makeSel, o1, o2, o3, removeBlend);
+            VSNotifyLayerAdded(selfInstance);
+        }, &g_origConfirmAdd5Blend);
+
+        VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", NSSelectorFromString(@"confirmAddingLayer:object:object2:object3:isAbleToShowTheLayerActionMenu:removeOverlayBlending:"), ^(id selfInstance, SEL makeSel, id o1, id o2, id o3, BOOL able, BOOL removeBlend) {
+            if (g_origConfirmAdd6)
+                ((void (*)(id, SEL, SEL, id, id, id, BOOL, BOOL))g_origConfirmAdd6)(selfInstance, NSSelectorFromString(@"confirmAddingLayer:object:object2:object3:isAbleToShowTheLayerActionMenu:removeOverlayBlending:"), makeSel, o1, o2, o3, able, removeBlend);
+            VSNotifyLayerAdded(selfInstance);
+        }, &g_origConfirmAdd6);
+
+        VSRobustSwizzleMethod(@"VideoReviewEditVC", NSSelectorFromString(@"shouldShowSplitPreview"), ^BOOL(id selfInstance) {
+            if (g_suppressSplitPreview) return NO;
+            if (g_origShouldShowSplitPreview)
+                return ((BOOL (*)(id, SEL))g_origShouldShowSplitPreview)(selfInstance, NSSelectorFromString(@"shouldShowSplitPreview"));
+            return NO;
+        }, &g_origShouldShowSplitPreview);
 
         VSRobustSwizzleMethod(@"MultiLayerWizEffectVC", @selector(didReceiveMemoryWarning), ^(id selfInstance) {
             g_memoryWarningAt = CFAbsoluteTimeGetCurrent();
@@ -1753,11 +1823,21 @@ static VSLayerFiller *g_activeFiller = nil;
 }
 
 - (void)selectSourceAndPick {
-    [self selectLayerV4:self.source then:^(BOOL ok) {
+    BOOL fastReplay = (g_cachedPickResponse != nil) && !self.requirePickerOpen;
+    void (^afterSelect)(BOOL) = ^(BOOL ok) {
         if (![self alive]) { [self finishWithStop:nil]; return; }
         if (!ok) { [self finishWithStop:@"Không chọn được lớp nguồn"]; return; }
-        VSDispatchAfterMS(self.requirePickerOpen ? 220 : 100, ^{ [self openPicker]; });
-    }];
+        if (fastReplay) {
+            [self openPicker];
+        } else {
+            VSDispatchAfterMS(self.requirePickerOpen ? 120 : 40, ^{ [self openPicker]; });
+        }
+    };
+    if (fastReplay) {
+        [self selectLayerTurbo:self.source then:afterSelect];
+    } else {
+        [self selectLayerV4:self.source then:afterSelect];
+    }
 }
 
 // Đoạn 1 (chưa có ảnh lưu): mở bảng chọn ảnh như cũ.
@@ -1819,7 +1899,7 @@ static VSLayerFiller *g_activeFiller = nil;
         return;
     }
 
-    VSSafePollEditor(self.runId, 60, 200, [self provider], ^BOOL(id e) {
+    VSSafePollEditor(self.runId, 25, 320, [self provider], ^BOOL(id e) {
         return [self pickConditionOn:e];
     }, ^(BOOL __unused ok) {
         [self afterPickWait];
@@ -1883,7 +1963,7 @@ static VSLayerFiller *g_activeFiller = nil;
 
 - (void)advance {
     self.nextIndex += 1;
-    VSDispatchAfterMS(15, ^{ [self copyNext]; });
+    VSDispatchAfterMS(0, ^{ [self copyNext]; });
 }
 
 - (void)skipTarget:(NSUInteger)target {
@@ -1898,13 +1978,11 @@ static VSLayerFiller *g_activeFiller = nil;
     if (VSPurchasePopupVisible(ed)) { [self finishWithStop:@"Popup mua Pro"]; return; }
 
     if (self.nextIndex >= self.layers.count) {
-        [self selectLayerTurbo:self.source then:^(BOOL __unused ok) {
-            id eFinal = self.editor;
-            if (eFinal) {
-                VSTry(^{ if ([eFinal respondsToSelector:@selector(refreshDisplay)]) [eFinal refreshDisplay]; });
-            }
-            [self finishWithStop:nil];
-        }];
+        id eFinal = self.editor;
+        if (eFinal) {
+            VSTry(^{ if ([eFinal respondsToSelector:@selector(refreshDisplay)]) [eFinal refreshDisplay]; });
+        }
+        [self finishWithStop:nil];
         return;
     }
 
@@ -1923,6 +2001,24 @@ static VSLayerFiller *g_activeFiller = nil;
 }
 
 - (void)copyToTarget:(NSUInteger)target {
+    id e1 = self.editor;
+    id eng1 = VSEngineFrom(e1);
+    if (e1 && eng1 && VSEditorIsAlive(e1)) {
+        NSString *beforeDirect = VSLayerSignature(eng1, target) ?: @"";
+        if (VSFireEngineCopyLayer(e1, eng1, self.source, target)) {
+            if (!VSEditorIsBusy(e1) && !VSPurchasePopupVisible(e1)) {
+                NSString *nowDirect = VSLayerSignature(eng1, target) ?: @"";
+                if (VSLayerAssetLoaded(eng1, target) && nowDirect.length > 0 && ![nowDirect isEqualToString:beforeDirect]) {
+                    self.copied += 1;
+                    [self advance];
+                    return;
+                }
+            }
+            [self waitCopyConfirmTarget:target before:beforeDirect];
+            return;
+        }
+    }
+
     [self selectLayerTurbo:target then:^(BOOL selected) {
         if (![self alive]) { [self finishWithStop:nil]; return; }
         if (!selected || !VSEditorIsAlive(self.editor)) { [self skipTarget:target]; return; }
@@ -1947,8 +2043,8 @@ static VSLayerFiller *g_activeFiller = nil;
 }
 
 - (void)waitCopyConfirmTarget:(NSUInteger)target before:(NSString *)before {
-    NSUInteger tries = (NSUInteger)(VS_COPY_CONFIRM_TIMEOUT * 1000.0 / 20.0);
-    VSSafePollEditor(self.runId, 20, tries, [self provider], ^BOOL(id e) {
+    NSUInteger tries = (NSUInteger)(VS_COPY_CONFIRM_TIMEOUT * 1000.0 / 10.0);
+    VSSafePollEditor(self.runId, 10, tries, [self provider], ^BOOL(id e) {
         if (VSPurchasePopupVisible(e)) return YES;
         VSResolvePopupsImmediately(e);
         if (VSEditorIsBusy(e)) return NO;
@@ -2130,7 +2226,7 @@ static VSQRBatchImporter *g_activeImporter = nil;
         st.multiScenePresets[i] = preset;
         st.multiSceneCodes[i] = codeId;
         s.index = i + 1;
-        VSDispatchAfterMS(300, ^{ [s next]; });
+        VSDispatchAfterMS(60, ^{ [s next]; });
     };
     t.qrCaptureProxy = proxy;
     VSSetQRDelegateSafely(qr, proxy);
@@ -2202,7 +2298,7 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
 - (void)nextScene {
     if (![self alive]) return;
     if (self.offset >= self.total) {
-        VSDispatchAfterMS(600, ^{ [self finishWithError:nil]; });
+        VSDispatchAfterMS(150, ^{ [self finishWithError:nil]; });
         return;
     }
     NSUInteger o = self.offset++;
@@ -2232,7 +2328,7 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
     [tool importPresetPayload:self.presets[o] codeIdentifier:self.codes[o] intoEditor:editor runId:runId completion:^(NSString *e1) {
         if (![self alive]) return;
         if (e1) { [self finishWithError:[NSString stringWithFormat:@"%@: %@", label, e1]]; return; }
-        VSDispatchAfterMS(450, ^{
+        VSDispatchAfterMS(40, ^{
             if (![self alive]) return;
             id ed = wEd;
             if (!VSEditorIsAlive(ed)) { [self finishWithError:[label stringByAppendingString:@": editor đã bị đóng"]]; return; }
@@ -2257,10 +2353,10 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
                     if (![self alive]) return;
                     if (e2) { [self finishWithError:[NSString stringWithFormat:@"%@: %@", label, e2]]; return; }
                     self.okCount += 1;
-                    VSSafePoll(runId, 100, 120, ^BOOL{ return VSFindTopViewControllerNamed(@"VideoReviewEditVC") != nil; }, ^(BOOL back) {
+                    VSSafePoll(runId, 30, 400, ^BOOL{ return VSFindTopViewControllerNamed(@"VideoReviewEditVC") != nil; }, ^(BOOL back) {
                         if (![self alive]) return;
                         if (!back) { [self finishWithError:@"Không quay lại được màn hình phân cảnh"]; return; }
-                        VSDispatchAfterMS(300, ^{ [self nextScene]; });
+                        VSDispatchAfterMS(40, ^{ [self nextScene]; });
                     });
                 }];
             }];
@@ -2576,6 +2672,7 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
     g_vsaAutomating = NO;
     g_captureMediaResponse = NO;
     g_silentMediaReplay = NO;
+    g_suppressSplitPreview = NO;
     g_cachedPickResponse = nil;
     g_onLayerAddedHandler = nil;
     self.currentTaskName = name;
@@ -2600,6 +2697,7 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
     g_vsaAutomating = NO;
     g_captureMediaResponse = NO;
     g_silentMediaReplay = NO;
+    g_suppressSplitPreview = NO;
     g_cachedPickResponse = nil;
     g_onLayerAddedHandler = nil;
     g_activeFiller = nil;
@@ -2725,7 +2823,8 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
         id s = wSv;
         if (!s) { [self finalizeTaskWithMessage:@"Mất màn hình chia beat"]; return; }
         if (count == 0 && VSCountOf(VSSafeValueForKey(s, @"splitTimes")) == 0) { [self finalizeTaskWithMessage:@"Không có beat"]; return; }
-        if (!VSTry(^{ [s doSplit]; })) { [self finalizeTaskWithMessage:@"Lỗi chia"]; return; }
+        g_suppressSplitPreview = YES;
+        if (!VSTry(^{ [s doSplit]; })) { g_suppressSplitPreview = NO; [self finalizeTaskWithMessage:@"Lỗi chia"]; return; }
         [self updateStatusHUD:@"Đang chia…"];
         VSSafePoll(runId, 120, 150, ^BOOL{
             __block NSUInteger now = 0;
@@ -2952,7 +3051,7 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
     if (existing) { done(existing); return; }
     if (!rvc) { done(nil); return; }
     if (!VSTry(^{ [rvc setLastViewedSceneIndex:scene]; [rvc showMultiLayer]; })) { done(nil); return; }
-    VSSafePoll(runId, 80, 100, ^BOOL{ return current() != nil; }, ^(BOOL ok) {
+    VSSafePoll(runId, 25, 320, ^BOOL{ return current() != nil; }, ^(BOOL ok) {
         done(ok ? current() : nil);
     });
 }
@@ -2966,7 +3065,7 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
     __weak id wEd = editor;
     VSObjProvider prov = ^id{ return wEd; };
     __block BOOL blocked = NO;
-    VSSafePollEditor(runId, 40, 250, prov, ^BOOL(id ed) {
+    VSSafePollEditor(runId, 20, 500, prov, ^BOOL(id ed) {
         VSPopupActionStatus s = VSResolvePopupsImmediately(ed);
         if (s == VSPopupActionStatusBlockedPurchase) { blocked = YES; return YES; }
         return g_presetImportEventCounter > before;
@@ -2974,16 +3073,13 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
         if (runId != g_runIdentifier) return;
         if (blocked) { done(@"Popup mua Pro"); return; }
         if (!ok) { done(@"Timeout 10s"); return; }
-        VSDispatchAfterMS(500, ^{
+        __block BOOL purchase = NO;
+        VSSafePollEditor(runId, 25, 160, prov, ^BOOL(id ed) {
+            if (VSResolvePopupsImmediately(ed) == VSPopupActionStatusBlockedPurchase) { purchase = YES; return YES; }
+            return !VSHasAnyActivePopup(ed) && !VSEditorIsBusy(ed) && VSNumActiveLayers(VSEngineFrom(ed)) > 0;
+        }, ^(BOOL ready) {
             if (runId != g_runIdentifier) return;
-            __block BOOL purchase = NO;
-            VSSafePollEditor(runId, 60, 60, prov, ^BOOL(id ed) {
-                if (VSResolvePopupsImmediately(ed) == VSPopupActionStatusBlockedPurchase) { purchase = YES; return YES; }
-                return !VSHasAnyActivePopup(ed) && VSNumActiveLayers(VSEngineFrom(ed)) > 0;
-            }, ^(BOOL ready) {
-                if (runId != g_runIdentifier) return;
-                done(purchase ? @"Popup mua Pro" : (ready ? nil : @"Engine chưa sẵn sàng"));
-            });
+            done(purchase ? @"Popup mua Pro" : (ready ? nil : @"Engine chưa sẵn sàng"));
         });
     });
 }
@@ -2993,13 +3089,13 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
     VSObjProvider prov = ^id{ return wEd; };
     __block NSUInteger stable = 0;
     __block BOOL purchase = NO;
-    VSSafePollEditor(runId, 80, 150, prov, ^BOOL(id ed) {
+    VSSafePollEditor(runId, 25, 480, prov, ^BOOL(id ed) {
         if (!VSEditorIsAlive(ed)) return YES;
         VSDismissLayerActionMenus(ed);
         if (VSResolvePopupsImmediately(ed) == VSPopupActionStatusBlockedPurchase) { purchase = YES; return YES; }
         BOOL calm = !VSHasAnyActivePopup(ed) && !VSEditorIsBusy(ed);
         stable = calm ? stable + 1 : 0;
-        return stable >= 6;
+        return stable >= 2;
     }, ^(BOOL ok) {
         if (runId != g_runIdentifier) return;
         if (purchase) { done(@"Popup mua Pro"); return; }
@@ -3029,7 +3125,7 @@ static VSSceneBatchRunner *g_activeBatchRunner = nil;
     __weak id wEd = editor;
     VSObjProvider prov = ^id{ return wEd; };
     __block BOOL blocked = NO;
-    VSSafePollEditor(runId, 100, 600, prov, ^BOOL(id ed) {
+    VSSafePollEditor(runId, 30, 2000, prov, ^BOOL(id ed) {
         if (VSResolvePopupsImmediately(ed) == VSPopupActionStatusBlockedPurchase) { blocked = YES; return YES; }
         return !([ed isViewLoaded] && [[ed view] window]);
     }, ^(BOOL closed) {
